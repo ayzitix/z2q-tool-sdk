@@ -1,16 +1,16 @@
 {
   "name": "z1-tool-sdk",
   "version": "0.1.0",
-  "description": "Author z1 tools declaratively: typed definitions, capabilities, a test harness, and a build CLI.",
+  "description": "z2q: author and run z1 tools declaratively - typed definitions, capabilities, a test harness, a QuickJS sandbox and a build CLI.",
   "author": "ayzitix",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ayzitix/z1-tool-sdk.git"
+    "url": "git+https://github.com/ayzitix/z2q-tool-sdk.git"
   },
-  "homepage": "https://github.com/ayzitix/z1-tool-sdk#readme",
+  "homepage": "https://github.com/ayzitix/z2q-tool-sdk#readme",
   "bugs": {
-    "url": "https://github.com/ayzitix/z1-tool-sdk/issues"
+    "url": "https://github.com/ayzitix/z2q-tool-sdk/issues"
   },
   "publishConfig": {
     "access": "public"

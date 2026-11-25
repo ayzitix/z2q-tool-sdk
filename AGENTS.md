@@ -1,7 +1,10 @@
 # Developer notes
 
+`z2q by z1` — the tool SDK for z1 agents. `z2q` is the product name; `z1` is the
+internal codename and stays in identifiers, paths, package names and imports.
 Small, dependency-light SDK for authoring z1 tools. The runtime injects the
-context; this repository only describes tools and builds them.
+context; this repository only describes tools, builds them and runs them in a
+QuickJS sandbox.
 
 ## Commands
 

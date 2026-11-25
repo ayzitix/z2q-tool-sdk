@@ -1,6 +1,11 @@
-# z1-tool-sdk
+# z2q by z1
 
-A small library for authoring **z1 tools** without importing z1-sdk internals.
+The tool SDK for **z1** agents: author **z1 tools** without importing z1-sdk
+internals, then run them in a QuickJS sandbox behind a capability broker.
+
+`z2q` is the product name. `z1` is the internal codename and stays in
+identifiers, paths, environment variables, package names and imports
+(`z1-tool-sdk`, `@z1/*`, `~/.z1`, `Z1_*`). Brand, not code.
 
 It defines the tool shape, capabilities, a typed context, an in-memory test
 harness, a deterministic manifest, and a build/pack CLI. The runtime (host
