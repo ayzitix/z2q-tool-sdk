@@ -302,6 +302,30 @@ library bug, not a policy hole:
 allocating loop) in their own child processes and captures stderr, so `npm test`
 never prints an abort and each measured row above is reproducible.
 
+## Tool creation flow
+
+`createToolCreator({ generate })` is a host-side flow around the pieces above:
+
+- The model's reply is **untrusted input**. It is extracted from a fence, linted,
+  built by the sandboxed definition reader, and smoke-tested in QuickJS. Nothing
+  in the flow imports the generated source on the host or calls `run` outside the
+  sandbox.
+- `propose()` writes a project tree under `proposalDir` (default
+  `<workspace>/.z2q/proposals`). Treat that directory as untrusted content: it
+  holds the model's source. A failed build or smoke test leaves the project there
+  for inspection; nothing cleans it up.
+- `install()` is the only writer into `toolsDir`, and the proposal's sha256 is
+  authoritative: a bundle that changed after its smoke test is refused, and an
+  `expectSha256` that disagrees is refused rather than accepted as an override.
+  `approval.json` is a plain record, not a signature — a hand-edited
+  `approvedBy`/`installedAt` is accepted while the sha256 and the capabilities are
+  rechecked.
+- A junction or symlink planted at the project path or at `<toolsDir>/<name>` is
+  refused: both are created with `lstat` plus a non-recursive `mkdir`.
+- The `workspace` you pass is the smoke test's workspace, and the generated tool
+  runs there with the capabilities it declares. Use a dedicated test directory,
+  not your working tree.
+
 ## Reporting
 
 This is a small SDK under active development (`0.1.x`). Report a sandbox escape

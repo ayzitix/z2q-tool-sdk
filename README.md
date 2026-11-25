@@ -447,9 +447,11 @@ const installed = await creator.install(proposal, { approvedBy: 'me' });
 `generate` receives `{ system, user, attempt, issues? }`; `issues` is present
 only on a retry. The repair paragraph names every lint issue. `propose()`
 writes only under `proposalDir` (default `<workspace>/.z2q/proposals`), never
-into `toolsDir`. `install()` is the only path that writes installed tools; it is
-an explicit human decision, passes the proposal's sha256 by default, and refuses
-a bundle changed after the smoke test. `workspace` is also the smoke-test
+into `toolsDir`, and refuses to write through a junction or symlink planted at
+the project path. `install()` is the only path that writes installed tools; it is
+an explicit human decision, treats the proposal's sha256 as authoritative (an
+`expectSha256` that disagrees is refused rather than accepted as an override) and
+refuses a bundle changed after the smoke test. `workspace` is also the smoke-test
 workspace, so use a dedicated test directory. A caller signal aborts a pending
 model call; it cannot interrupt the synchronous QuickJS smoke test, and an abort
 during that step is reported when it returns.
