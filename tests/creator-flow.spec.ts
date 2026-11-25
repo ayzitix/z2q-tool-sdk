@@ -273,6 +273,17 @@ describe('createToolCreator: install and defaults', () => {
     expect(detailsOf(again).code).toBe('version_exists');
   });
 
+  it('refuses a reserved Windows device name as a tool name', async () => {
+    const workspace = await tempDir('z2q-flow-device-');
+    const creator = creatorFor(workspace, stub([sourceFor()]));
+
+    for (const name of ['con', 'nul', 'com1', 'lpt1']) {
+      const error = await rejection(creator.propose({ name, purpose: PURPOSE }));
+      expect(error.code).toBe('invalid_request');
+      expect(error.message).toContain('reserved device name');
+    }
+  });
+
   it('refuses malformed options and a signal that is not an AbortSignal', async () => {
     const workspace = await tempDir('z2q-flow-options-');
     const creator = creatorFor(workspace, stub([sourceFor()]));

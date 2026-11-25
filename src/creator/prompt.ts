@@ -191,8 +191,45 @@ export function normalizeToolName(input: string): string {
       `tool name could not be normalised to 3-64 characters, got "${input}"`,
     );
   }
+  if (RESERVED_DIRECTORY_NAMES.has(candidate.toLowerCase())) {
+    throw new ToolCreatorError(
+      'invalid_request',
+      `"${candidate}" is a reserved device name and cannot be used as a tool directory`,
+    );
+  }
   return candidate;
 }
+
+/**
+ * Windows device names are not usable as directory names: `<toolsDir>/con/` is
+ * fragile on Windows (`del con`, archivers and some scanners refuse it). The
+ * creator refuses them up front so a tool cannot be created that cannot be
+ * installed or copied.
+ */
+const RESERVED_DIRECTORY_NAMES = new Set([
+  'con',
+  'prn',
+  'aux',
+  'nul',
+  'com1',
+  'com2',
+  'com3',
+  'com4',
+  'com5',
+  'com6',
+  'com7',
+  'com8',
+  'com9',
+  'lpt1',
+  'lpt2',
+  'lpt3',
+  'lpt4',
+  'lpt5',
+  'lpt6',
+  'lpt7',
+  'lpt8',
+  'lpt9',
+]);
 
 /** True when `value` is a valid tool name (the same pattern `defineTool` uses). */
 export function isValidToolName(value: unknown): value is string {
@@ -200,7 +237,8 @@ export function isValidToolName(value: unknown): value is string {
     typeof value === 'string' &&
     value.length >= MIN_NAME_LENGTH &&
     value.length <= MAX_NAME_LENGTH &&
-    NAME_PATTERN.test(value)
+    NAME_PATTERN.test(value) &&
+    !RESERVED_DIRECTORY_NAMES.has(value.toLowerCase())
   );
 }
 
