@@ -275,6 +275,18 @@ export const tool = defineTool({
 });
 
 describe('installed versions', () => {
+  it('refuses a manifest whose name is a reserved Windows device name', async () => {
+    const dir = await tempDir('z1-install-device-');
+    const manifest = rawManifest({ name: 'con' });
+    await writeRawPackage(dir, rawToolSource(manifest, '({ ok: true })'), manifest);
+    const toolsDir = join(await tempDir('z1-install-device-tools-'), 'tools');
+
+    const error = await rejection(installTool({ toolsDir, dir, allowPrebuilt: true }));
+
+    expect(error.code).toBe('invalid_name');
+    expect(await stat(join(toolsDir, 'con')).catch(() => undefined)).toBeUndefined();
+  });
+
   it('refuses to install through a junction at the tool directory', async () => {
     const fs = await import('node:fs/promises');
     const root = await tempDir('z1-install-link-');
