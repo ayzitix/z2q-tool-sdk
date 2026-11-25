@@ -1,6 +1,7 @@
 import { isToolManifest } from './manifest.js';
+import { readToolDefinition } from './runtime/definition.js';
 import { toPlainJson } from './schema.js';
-import type { AnyToolDefinition, ToolManifest } from './types.js';
+import type { ToolManifest } from './types.js';
 
 export interface BuildToolOptions {
   /** Path to the tool entry (usually `tool.ts`). Relative paths resolve against `cwd`. */
@@ -13,6 +14,11 @@ export interface BuildToolOptions {
   sourcemap?: boolean;
   /** Extra esbuild externals. Node builtins are always external. */
   external?: string[];
+  /**
+   * Map exact import specifiers to absolute files. The creator uses this to
+   * build a fresh project before `npm install`; an unset map changes nothing.
+   */
+  aliases?: Record<string, string>;
 }
 
 export interface BuildToolResult {
@@ -51,9 +57,10 @@ interface PackageJson {
 /**
  * Bundle a tool entry and write `tool.json` next to the bundle.
  *
- * This imports the bundled module to read its definition, but never calls
- * `run`. It needs `esbuild`, resolved from the tool project first and from the
- * SDK installation second.
+ * The bundle's top level is read in QuickJS, with no bridge, so a malicious or
+ * merely broken module cannot reach the host while its manifest is read. `run`
+ * is never called. It needs `esbuild`, resolved from the tool project first and
+ * from the SDK installation second.
  */
 export async function buildTool(options: BuildToolOptions): Promise<BuildToolResult> {
   const fs = await import('node:fs/promises');
@@ -85,6 +92,7 @@ export async function buildTool(options: BuildToolOptions): Promise<BuildToolRes
       sourcemap: options.sourcemap ?? false,
       minify: options.minify ?? false,
       external: options.external ?? [],
+      plugins: aliasPlugins(options.aliases),
       logLevel: 'silent',
     });
   } catch (error) {
@@ -92,15 +100,17 @@ export async function buildTool(options: BuildToolOptions): Promise<BuildToolRes
     throw new Error(`failed to bundle ${entry}: ${detail}`);
   }
 
-  const tool = await importToolDefinition(bundlePath);
+  const source = await fs.readFile(bundlePath, 'utf8');
+  const { manifest } = await readToolDefinition(source);
+  assertManifest(manifest, bundlePath);
   const manifestPath = path.join(outDir, 'tool.json');
-  await fs.writeFile(manifestPath, `${JSON.stringify(tool.manifest, null, 2)}\n`, 'utf8');
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
   return {
     entry,
     bundlePath,
     manifestPath,
-    manifest: tool.manifest,
+    manifest,
   };
 }
 
@@ -184,6 +194,31 @@ SOFTWARE.
 `;
 }
 
+function aliasPlugins(aliases: Record<string, string> | undefined): import('esbuild').Plugin[] {
+  if (aliases === undefined) return [];
+  const entries = Object.entries(aliases).filter(
+    ([specifier, target]) => specifier.length > 0 && typeof target === 'string' && target.length > 0,
+  );
+  if (entries.length === 0) return [];
+  const targets = new Map(entries);
+  const filter = new RegExp(`^(?:${entries.map(([specifier]) => escapeRegExp(specifier)).join('|')})$`);
+  return [
+    {
+      name: 'z1-tool-sdk-aliases',
+      setup(build) {
+        build.onResolve({ filter }, (args) => {
+          const target = targets.get(args.path);
+          return target === undefined ? undefined : { path: target };
+        });
+      },
+    },
+  ];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 async function loadEsbuild(fromDir: string): Promise<typeof import('esbuild')> {
   const path = await import('node:path');
   const { createRequire } = await import('node:module');
@@ -226,32 +261,16 @@ async function importEsbuild(url: string): Promise<typeof import('esbuild')> {
   throw new Error('the installed esbuild package does not export build()');
 }
 
-async function importToolDefinition(bundlePath: string): Promise<AnyToolDefinition> {
-  const { pathToFileURL } = await import('node:url');
-  const url = `${pathToFileURL(bundlePath).href}?z1-tool-sdk=${Date.now()}`;
-  const module = (await import(url)) as Record<string, unknown>;
-  const candidate = module.tool ?? module.default ?? module;
-  return assertToolDefinition(candidate, bundlePath);
-}
-
-function assertToolDefinition(value: unknown, file: string): AnyToolDefinition {
+function assertManifest(value: unknown, file: string): asserts value is ToolManifest {
   const hint = `${file} must export a tool created with defineTool (named export "tool" or default export)`;
-  if (typeof value !== 'object' || value === null) {
-    throw new Error(hint);
-  }
-  const candidate = value as { manifest?: unknown; run?: unknown };
-  if (typeof candidate.run !== 'function') {
-    throw new Error(`${hint}: run is not a function`);
-  }
-  if (!isToolManifest(candidate.manifest)) {
+  if (!isToolManifest(value)) {
     throw new Error(`${hint}: manifest is missing or malformed`);
   }
   try {
-    toPlainJson(candidate.manifest, 'manifest');
+    toPlainJson(value, 'manifest');
   } catch (error) {
     throw new Error(`${hint}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return candidate as AnyToolDefinition;
 }
 
 function authorOf(pkg: PackageJson): string | undefined {

@@ -26,7 +26,15 @@ external; the rest of `dist/` is plain `tsc` output.
 - `src/manifest.ts` — shared `isToolManifest` shape check used by build, pack and the runtime.
 - `src/build.ts` — `buildTool`, `packTool`, tar writer, lazy esbuild loader.
 - `src/cli.ts` — `z1-tool` CLI (Node-only; may import node builtins).
+- `src/creator/index.ts` — the Tool Creator public surface, re-exported from the package root.
+- `src/creator/prompt.ts` — `ToolRequest`, `ToolPrompt`, name normalisation, `buildToolPrompt`, `ToolCreatorError`.
+- `src/creator/review.ts` — the lexer, rules 1-10, `reviewToolSource`, `verifyToolSource`, `assessToolManifest`, `buildToolProject`.
+- `src/creator/project.ts` — `scaffoldToolProject` (six files, no build), `createToolProject` (review, write, build, confirm).
+- `src/creator/smoke.ts` — `smokeTestTool`, one sandbox run per sample.
+- `src/creator/install.ts` — immutable installs, `approval.json`, list and load with the sha check.
+- `src/creator/capabilities.ts` — `describeCapabilities` for an approval prompt.
 - `src/runtime/index.ts` — `z1-tool-sdk/runtime`: `createToolRuntime`, `ToolRuntime.run`, options, sinks.
+- `src/runtime/definition.ts` — the sandboxed manifest read used by `buildTool`; one module, no bridge, one 1 MiB cap.
 - `src/runtime/sandbox.ts` — the QuickJS half: one runtime per call, one `Scope`, every handle.
 - `src/runtime/policy.ts` — the pure capability policy (paths, globs, argv, env, realpath).
 - `src/runtime/broker.ts` — the only code that reads files or spawns processes.
@@ -37,6 +45,7 @@ external; the rest of `dist/` is plain `tsc` output.
 - `src/runtime/shim.ts` — the VM-side source strings; no host imports may appear inside.
 - `src/runtime/host.ts` — lazy `node:` modules behind structural types.
 - `examples/` — realistic tool entries built by the test suite.
+- `tests/creator-*.spec.ts` — creator rules, project, install and CLI; the CLI spec bundles `dist/cli.js` and spawns it in temp dirs.
 
 ## Rules
 
@@ -49,8 +58,9 @@ external; the rest of `dist/` is plain `tsc` output.
 3. The manifest must stay deterministic, plain JSON and function-free. Use
    `toPlainJson` when accepting externally produced data, and update tests if
    the shape changes.
-4. `buildTool` must never call `run`. It imports the bundle to read the
-   definition; `tests/build.spec.ts` guards this.
+4. `buildTool` must never call `run`. It reads the bundle's definition in
+   QuickJS, with no bridge; `tests/build.spec.ts` and
+   `tests/creator-host-isolation.spec.ts` guard this.
 5. `process.run` is argv-only. Never accept or build a shell string.
 6. zod stays on 4.x and schema conversion goes through `z.toJSONSchema` with
    `target: 'draft-2020-12'` and `io: 'input'`. Do not add a JSON Schema
@@ -92,6 +102,43 @@ external; the rest of `dist/` is plain `tsc` output.
    function, or through `src/runtime/host.ts`) and the VM source in `shim.ts` as
    a literal string. `npm run build` must keep `quickjs-emscripten` external in
    `dist/cli.js`; it loads a `.wasm` file esbuild cannot bundle.
+
+13. **`reviewToolSource` is deny-by-default and its rule set is closed.** One
+    issue per rule, and any issue means refuse. It never executes, never touches
+    the filesystem and never imports the source. Strings, comments and template
+    text are not identifiers; template interpolations are code; identifier
+    escapes are decoded; property names, class field names, object-pattern
+    shorthand bindings and member accesses are names (so `ctx.process.run` and
+    `process: { argv }` reach rules 7 and 8). Regex literals are skipped only
+    where the scanner can tell them from division; an ambiguous slash (after
+    `}`, `+`/`-`, a control-condition `)`, or the contextual `of`) is
+    `scan_failed`, never a guess. The review is an **advisory lint**, not a
+    boundary. Do not add a rule, a code or an escape hatch without updating the
+    tests, the README and `SECURITY.md`.
+14. **A build never executes tool code on the host.** `src/runtime/definition.ts`
+    imports the bundle in a fresh QuickJS runtime with no bridge and returns only
+    the manifest; `buildTool` uses it, so `z1-tool build` and the definition
+    read behind `z1-tool test` inherit the boundary. Do not reintroduce
+    `await import(bundlePath)` in `build.ts` or any creator path. Keep the
+    manifest cap at 1 MiB: a larger string can make `runtime.dispose()` throw the
+    documented QuickJS abort. A static import that survives bundling must fail
+    with the "bundle everything" message. A thrown value must be capped *inside*
+    the VM before it crosses: an attacker-sized error otherwise allocates on the
+    host and makes the teardown print its abort line. The lint still proves
+    shape, not intent; the sandbox is the boundary. The boundary covers the tool
+    entry, not the project's `node_modules`: `buildTool` loads the project's own
+    esbuild.
+15. **Installed versions are immutable.** When `tool.ts` exists, `installTool`
+    always rebuilds before installing; never sign a stale `dist/`. A dist-only
+    directory needs `expectSha256` or `allowPrebuilt: true`.
+    `<toolsDir>/<name>/<version>` is reserved with a non-recursive `mkdir`; never
+    overwrite, rename or patch an existing version. `approval.json` records the
+    sha256 and the resolved capabilities, and `loadInstalledTool` rechecks both.
+    The hash covers `dist/index.js`; the capabilities comparison covers
+    `dist/tool.json`.
+16. **The creator has no provider, no network and no model.** The model call is
+    the host's. Do not add an SDK client, a key, a `fetch`, or provider-specific
+    text to `src/creator/*`; the prompts are plain deterministic text.
 
 ## Adding a capability
 

@@ -118,9 +118,9 @@ pins the code and the fact that it can overrun, never a tight bound.
 
 ## What the sandbox does not protect against
 
-- **A malicious tool is still code you built.** `buildTool` imports the entry in
-  the host to read its definition; that is outside the sandbox. Review a tool
-  before building it.
+- **A malicious tool is still code you chose to run.** The definition read is
+  sandboxed, but once the host invokes the tool it has every capability the
+  manifest declares. Treat generated code as untrusted and keep the approval.
 - **TOCTOU.** Path checks happen before the read or write. A workspace the tool
   can also modify through another process could change between the check and the
   operation.
@@ -162,6 +162,104 @@ name — secret denials record `target: '<redacted>'`.
 Rows are capped per call; when the cap is hit the sink sees one summary row with
 `code: 'audit_limit'`. A sink that throws is ignored after one warning: auditing
 never breaks a tool call.
+
+## Tool Creator
+
+`z1-tool-sdk` also ships the deterministic half of a tool creator
+(`src/creator/*`, exported from the package root). It is authoring-side code. The
+static review is an advisory lint; the boundary is the QuickJS sandbox, including
+the sandboxed definition read that `buildTool` now uses. This section says what
+each part guarantees and what it does not.
+
+### What the creator guarantees
+
+- `reviewToolSource(source)` is synchronous and static. It never executes the
+  source, never loads it and never touches the filesystem. Its rules are closed
+  (rules 1-10 in the README, plus the `scan_failed` lexer outcome): size and
+  ESM/`defineTool` shape, allowed imports, forbidden identifiers, a literal
+  `capabilities` object, no `net`, bare `process.argv` names,
+  workspace-relative `fs` grants, the limit ceilings and a literal description
+  of at least 20 characters. Any issue means refuse. It is an advisory lint:
+  passing proves shape, not intent.
+- **`buildTool` never imports the bundle on the host.** `src/runtime/definition.ts`
+  creates a fresh QuickJS runtime, serves the bundle from a module loader, and
+  imports it with no bridge: no `__z1_invoke`, no `__z1_args`, no `console`
+  passthrough, no host function. Only the manifest JSON leaves the VM, capped at
+  1 MiB inside the VM before it crosses. A bundle containing a static import that
+  survived bundling fails with the "bundle everything" message, except for
+  `node:*`: esbuild always leaves those external, so the reader serves an inert
+  module whose bindings are `undefined` and the runtime keeps its own node-builtin
+  refusal at run time. A thrown value is capped inside the VM before it crosses,
+  so an attacker-sized error cannot allocate on the host; while it disposes its
+  own runtime the reader filters the one measured teardown assertion line
+  (`Aborted(Assertion failed: list_empty(&rt->gc_obj_list) …`), so a review of
+  hostile text stays readable, and the guarded dispose keeps any remaining
+  teardown abort from propagating as an exception. `verifyToolSource`,
+  `createToolProject`, `smokeTestTool`, `installTool`, `z1-tool build` and the
+  definition read behind `z1-tool test` all inherit this boundary.
+- **The boundary covers the tool entry, not the project's dependencies.**
+  `buildTool` loads the project's own `esbuild` (measured: a project-local
+  `node_modules/esbuild` runs on the host before the tool source is read), and
+  `z1-tool test` runs the project's own vitest suite when vitest is installed.
+  Point a build or an install at a directory whose dependency tree you trust;
+  `npm install` already dominates that risk.
+- `installTool` always rebuilds when `tool.ts` exists, so a stale `dist/` is
+  never signed; a dist-only directory needs `expectSha256` or
+  `allowPrebuilt: true`. It recomputes the sha256 with `node:crypto`, refuses a
+  net grant, invalid grants or oversized limits in the manifest, copies exactly
+  `dist/tool.json` and `dist/index.js`, re-reads the copied bytes and the copied
+  manifest, writes `approval.json`, and never overwrites a version.
+  `expectSha256` / `expectCapabilities` refuse a build different from the one the
+  caller reviewed, before anything is written.
+- `loadInstalledTool` rechecks the bundle sha256, the manifest name and version,
+  and the capabilities against `approval.json` on every load. A tampered bundle
+  or `tool.json` is refused.
+- Generated capabilities must be literal declarations. A computed declaration
+  is refused precisely so the decision happens before the build. `net` is
+  refused even with an empty host list. The static ceilings are 32 KiB of
+  source, `timeoutMs <= 60000`, `maxOutputBytes <= 8388608` and a description of
+  at least 20 characters.
+- `describeCapabilities` only reads the manifest: it never grants, opens or
+  runs anything, and it quotes values so a grant cannot break the prompt into
+  extra lines.
+
+### What it does not guarantee
+
+- **Intent, not shape.** The lint cannot prove what a tool does or that it is
+  safe. A source that passes every rule is still code. It runs only when the
+  host invokes it, inside QuickJS with the capabilities the manifest declares,
+  and the sandbox is the boundary. The lint is not a JavaScript verifier:
+  reflection and dynamic property access are not modeled, and the identifier
+  list does not include every ambient global. Treat generated code as untrusted
+  even after a pass, and keep the human approval in the loop.
+- **The file can change between review and build.** `installTool` always
+  rebuilds `tool.ts` before signing, rechecks the copied bytes and manifest, and
+  binds the approval to the sha and capabilities it read. A dist-only directory
+  is refused unless the caller passes `expectSha256` or `allowPrebuilt: true`;
+  `loadInstalledTool` catches later modification.
+- **`listInstalledTools` is a reader, not a verifier.** It does not rehash the
+  bundle; `loadInstalledTool` does. Use the latter at run time.
+- **The review is lexical.** Strings, comments and template text are skipped;
+  template interpolations are code; identifier escapes are decoded; property
+  names and member accesses are names (which is what lets `ctx.process.run` and
+  the `process: { argv }` capability key reach rules 7 and 8). Regex literals
+  are skipped where the scanner can tell them from division; an ambiguous slash
+  (after `}`, `+`/`-`, a control-condition `)`, or the contextual `of`) is
+  `scan_failed`, refused rather than guessed. A
+  computed description or capabilities declaration is refused rather than
+  evaluated.
+- **The lint is not the build boundary.** `buildTool` reads the definition in
+  QuickJS with no bridge, so `z1-tool build`, `z1-tool test`'s build path and
+  every creator build avoid a host import. Do not reintroduce one. The sandbox
+  still grants whatever the manifest declares; a valid capability is not a
+  safety proof.
+- **No provider, network or model.** The SDK never calls a model and has no
+  network client. The host owns the model call and the approval.
+
+The `approval.json` hash covers `dist/index.js`; the capabilities comparison
+covers `dist/tool.json`. Extra files are not copied. `--tools` defaults to
+`./.z1/tools`; `.z1` is a denied segment inside a tool workspace, so choose a
+tools directory outside the tool's workspace when the host must read it.
 
 ## Known QuickJS issue: the teardown abort
 

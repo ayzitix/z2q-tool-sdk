@@ -4,6 +4,7 @@ export { createTestContext } from './testing.js';
 export { buildTool } from './build.js';
 export type { BuildToolOptions, BuildToolResult } from './build.js';
 
+export * from './creator/index.js';
 export type * from './types.js';
 export type {
   RecordedCall,
