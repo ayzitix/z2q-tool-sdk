@@ -145,6 +145,11 @@ export interface NetFetchResult {
 export interface ToolContext {
   /** Absolute workspace root. */
   readonly workspace: string;
+  /**
+   * Aborts the call at the next host boundary. In the QuickJS runtime this is a
+   * frozen `{ aborted: false }` object: the VM runs synchronously, so a tool
+   * cannot observe an abort mid-call — the host ends the call instead.
+   */
   readonly signal: AbortSignal;
   readonly fs: {
     read(path: string): Promise<string>;

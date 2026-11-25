@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { buildTool, mitLicenseText, packTool } from './build.js';
 import { assertToolName } from './define.js';
+import { ToolRuntimeError } from './runtime/errors.js';
 import type { ToolManifest } from './types.js';
 
 const HELP = `z1-tool - author, test and package z1 tools
@@ -18,6 +19,7 @@ Commands:
   build [dir]        bundle tool.ts to dist/index.js and write dist/tool.json
   test [dir]         run vitest when installed, otherwise a manifest smoke check
   pack [dir]         pack tool.json, dist/index.js, package.json, LICENSE into a .tgz
+  run <dir>          run a built tool in the QuickJS sandbox (--args, --workspace)
 
 Options:
   -h, --help         show this help
@@ -48,6 +50,8 @@ async function main(argv: string[]): Promise<number> {
       return testCommand(args);
     case 'pack':
       return packCommand(args);
+    case 'run':
+      return runCommand(args);
     default:
       throw new Error(`unknown command "${command}" (try: z1-tool --help)`);
   }
@@ -141,6 +145,76 @@ async function packCommand(args: string[]): Promise<number> {
   const result = await packTool({ dir });
   console.log(`packed ${result.path} sha256 ${result.sha256}`);
   return 0;
+}
+
+async function runCommand(args: string[]): Promise<number> {
+  if (hasHelp(args)) {
+    console.log(
+      [
+        'Usage: z1-tool run <dir> [--args <json>] [--workspace <dir>]',
+        '',
+        'Runs a built tool (dist/tool.json + dist/index.js) in the sandboxed QuickJS',
+        'runtime and prints its JSON result. --workspace defaults to the current',
+        'directory. Exits 1 with the runtime error code on failure.',
+      ].join('\n'),
+    );
+    return 0;
+  }
+  const parsed = parseRunArgs(args);
+  let toolArgs: unknown;
+  try {
+    toolArgs = JSON.parse(parsed.argsJson);
+  } catch {
+    throw new Error('--args must be valid JSON');
+  }
+  const { createToolRuntime } = await import('./runtime/index.js');
+  const runtime = await createToolRuntime({
+    workspace: parsed.workspace,
+    onLog: (level, message) => {
+      console.error(`[${level}] ${message}`);
+    },
+  });
+  const result = await runtime.run(parsed.dir, toolArgs);
+  console.log(JSON.stringify(result.value));
+  return 0;
+}
+
+interface RunArgs {
+  dir: string;
+  argsJson: string;
+  workspace: string;
+}
+
+function parseRunArgs(args: string[]): RunArgs {
+  let argsJson = '{}';
+  let workspace = process.cwd();
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] ?? '';
+    if (arg === '--args' || arg === '--workspace') {
+      const value = args[index + 1];
+      if (value === undefined) {
+        throw new Error(`${arg} requires a value`);
+      }
+      index += 1;
+      if (arg === '--args') argsJson = value;
+      else workspace = resolve(value);
+      continue;
+    }
+    if (arg.startsWith('--args=')) {
+      argsJson = arg.slice('--args='.length);
+      continue;
+    }
+    if (arg.startsWith('--workspace=')) {
+      workspace = resolve(arg.slice('--workspace='.length));
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw new Error(`unknown option "${arg}" (try: z1-tool run --help)`);
+    }
+    positional.push(arg);
+  }
+  return { dir: resolve(positional[0] ?? '.'), argsJson, workspace };
 }
 
 async function smokeCheck(entry: string): Promise<ToolManifest> {
@@ -319,6 +393,7 @@ main(process.argv.slice(2))
   })
   .catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`z1-tool: ${message}`);
+    const code = error instanceof ToolRuntimeError ? `${error.code}: ` : '';
+    console.error(`z1-tool: ${code}${message}`);
     process.exitCode = 1;
   });
