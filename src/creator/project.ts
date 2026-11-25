@@ -48,7 +48,6 @@ interface ProjectFacts {
 export async function scaffoldToolProject(
   options: ToolProjectOptions,
 ): Promise<ToolProjectScaffold> {
-  const fs = await import('node:fs/promises');
   const path = await import('node:path');
   const request = resolveToolRequest(options.request);
   const report = reviewToolSource(options.source);
@@ -68,8 +67,7 @@ export async function scaffoldToolProject(
   }
 
   const dir = path.resolve(options.cwd ?? process.cwd(), options.dir);
-  await assertEmptyDirectory(dir);
-  await fs.mkdir(dir, { recursive: true });
+  await createProjectDirectory(dir);
   const facts: ProjectFacts = {
     name: report.name ?? request.name,
     version: report.version ?? '0.1.0',
@@ -92,7 +90,6 @@ export async function scaffoldToolProject(
 export async function createToolProject(
   options: ToolProjectOptions,
 ): Promise<ToolProjectResult> {
-  const fs = await import('node:fs/promises');
   const path = await import('node:path');
   const request = resolveToolRequest(options.request);
   const staticReport = reviewToolSource(options.source);
@@ -112,8 +109,7 @@ export async function createToolProject(
   }
 
   const dir = path.resolve(options.cwd ?? process.cwd(), options.dir);
-  await assertEmptyDirectory(dir);
-  await fs.mkdir(dir, { recursive: true });
+  await createProjectDirectory(dir);
 
   const facts: ProjectFacts = {
     name: staticReport.name ?? request.name,
@@ -323,10 +319,50 @@ describe('${facts.name}', () => {
 `;
 }
 
+/**
+ * Create the project directory without ever writing through a link.
+ *
+ * The parent is created recursively (the proposal root may not exist yet), then
+ * the directory itself is created **non-recursively**: `mkdir` returns `EEXIST`
+ * for a junction or symlink instead of accepting it, which closes the gap
+ * `assertEmptyDirectory` can leave between its `lstat` and the create.
+ */
+async function createProjectDirectory(dir: string): Promise<void> {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  await assertEmptyDirectory(dir);
+  await fs.mkdir(path.dirname(dir), { recursive: true });
+  try {
+    await fs.mkdir(dir);
+  } catch (error) {
+    if (!isAlreadyExists(error)) throw error;
+    // Something appeared in the meantime; refuse unless it is a real, empty
+    // directory (a link is refused by `assertEmptyDirectory` itself).
+    await assertEmptyDirectory(dir);
+  }
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'EEXIST'
+  );
+}
+
 async function assertEmptyDirectory(dir: string): Promise<void> {
   const fs = await import('node:fs/promises');
-  const info = await fs.stat(dir).catch(() => undefined);
+  // `lstat`, not `stat`: a junction or symlink planted at this exact path would
+  // otherwise look like an empty directory and every project file would land in
+  // its target, outside the caller's `proposalDir`.
+  const info = await fs.lstat(dir).catch(() => undefined);
   if (info === undefined) return;
+  if (info.isSymbolicLink()) {
+    throw new ToolCreatorError(
+      'project_not_empty',
+      `refusing to write through a link: ${dir} is a symbolic link or junction`,
+    );
+  }
   if (!info.isDirectory()) {
     throw new ToolCreatorError('project_not_empty', `not a directory: ${dir}`);
   }

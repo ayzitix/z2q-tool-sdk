@@ -298,4 +298,23 @@ describe('scaffoldToolProject', () => {
     expect(await exists(join(dir, 'dist'))).toBe(false);
     expect(await readFile(join(dir, 'tool.ts'), 'utf8')).toBe(source);
   });
+
+  it('refuses to write a project through a junction at the project path', async () => {
+    const fs = await import('node:fs/promises');
+    const base = await tempDir('z1-project-link-');
+    const outside = join(base, 'outside');
+    const linked = join(base, 'linked');
+    await fs.mkdir(outside, { recursive: true });
+    await fs.symlink(outside, linked, 'junction');
+
+    const source = projectSource('tool.linked');
+    await expect(
+      createToolProject({
+        dir: linked,
+        request: { name: 'tool.linked', purpose: PURPOSE },
+        source,
+      }),
+    ).rejects.toThrow(ToolCreatorError);
+    expect(await fs.readdir(outside)).toEqual([]);
+  });
 });

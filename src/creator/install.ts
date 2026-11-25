@@ -130,11 +130,19 @@ export async function installTool(options: InstallToolOptions): Promise<Installe
   const toolDir = path.join(toolsDir, manifest.name);
   const versionDir = path.join(toolDir, manifest.version);
   await fs.mkdir(toolsDir, { recursive: true });
-  const toolInfo = await fs.stat(toolDir).catch(() => undefined);
+  // `lstat`, not `stat`: a junction planted at `<toolsDir>/<name>` would
+  // otherwise look like a directory and the install would land in its target.
+  const toolInfo = await fs.lstat(toolDir).catch(() => undefined);
+  if (toolInfo !== undefined && toolInfo.isSymbolicLink()) {
+    throw new ToolCreatorError(
+      'version_exists',
+      `refusing to install through a link: ${toolDir} is a symbolic link or junction`,
+    );
+  }
   if (toolInfo !== undefined && !toolInfo.isDirectory()) {
     throw new ToolCreatorError('version_exists', `${toolDir} exists and is not a directory`);
   }
-  await fs.mkdir(toolDir, { recursive: true });
+  if (toolInfo === undefined) await fs.mkdir(toolDir);
 
   try {
     await fs.mkdir(versionDir);

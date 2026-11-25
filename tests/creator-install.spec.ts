@@ -275,6 +275,22 @@ export const tool = defineTool({
 });
 
 describe('installed versions', () => {
+  it('refuses to install through a junction at the tool directory', async () => {
+    const fs = await import('node:fs/promises');
+    const root = await tempDir('z1-install-link-');
+    const toolsDir = join(root, 'tools');
+    const outside = join(root, 'outside');
+    await fs.mkdir(toolsDir, { recursive: true });
+    await fs.mkdir(outside, { recursive: true });
+    await fs.symlink(outside, join(toolsDir, NAME), 'junction');
+
+    const error = await rejection(installTool({ toolsDir, dir: projectDir }));
+
+    expect(error.code).toBe('version_exists');
+    expect(error.message).toContain('link');
+    expect(await fs.readdir(outside)).toEqual([]);
+  });
+
   it('lists every version and loads the highest when no version is given', async () => {
     const toolsDir = join(base, 'tools-versions');
     for (const version of ['0.1.0', '0.2.0']) {
