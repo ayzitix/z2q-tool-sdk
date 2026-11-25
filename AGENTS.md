@@ -35,6 +35,7 @@ external; the rest of `dist/` is plain `tsc` output.
 - `src/creator/project.ts` — `scaffoldToolProject` (six files, no build), `createToolProject` (review, write, build, confirm).
 - `src/creator/smoke.ts` — `smokeTestTool`, one sandbox run per sample.
 - `src/creator/install.ts` — immutable installs, `approval.json`, list and load with the sha check.
+- `src/creator/flow.ts` — `createToolCreator`, injected `generate`, repair retries, proposal and explicit install.
 - `src/creator/capabilities.ts` — `describeCapabilities` for an approval prompt.
 - `src/runtime/index.ts` — `z1-tool-sdk/runtime`: `createToolRuntime`, `ToolRuntime.run`, options, sinks.
 - `src/runtime/definition.ts` — the sandboxed manifest read used by `buildTool`; one module, no bridge, one 1 MiB cap.
@@ -142,6 +143,12 @@ external; the rest of `dist/` is plain `tsc` output.
 16. **The creator has no provider, no network and no model.** The model call is
     the host's. Do not add an SDK client, a key, a `fetch`, or provider-specific
     text to `src/creator/*`; the prompts are plain deterministic text.
+17. **`flow.ts` stays model-agnostic and never installs implicitly.**
+    `createToolCreator` calls only the injected `generate`; it must not import a
+    provider, open a network connection or read a key. `propose()` writes only
+    under `proposalDir`; `install()` is the only path that writes into `toolsDir`
+    and must pass `expectSha256`. Keep the repair prompt deterministic and
+    include the exact review issues.
 
 ## Adding a capability
 

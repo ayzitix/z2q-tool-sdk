@@ -419,6 +419,41 @@ exists and prints the capability summary and the install path; a dist-only
 directory needs `--expect-sha256` or `--allow-prebuilt`. `installed` lists
 versions. `--tools` defaults to `./.z1/tools`.
 
+### Connecting a model
+
+`createToolCreator` is the host glue. It builds the prompt, calls **your**
+`generate` callback, extracts the source from a fence, lints it, retries with
+the exact issues (two attempts by default, configurable 1-5), writes the
+project, hashes and smoke-tests the bundle, and returns a proposal. The SDK
+ships no provider, no network client and no model.
+
+```ts
+import { createToolCreator } from 'z1-tool-sdk';
+
+const creator = createToolCreator({
+  workspace: '/absolute/project',
+  generate: async ({ system, user }) => myModel(system, user),
+});
+
+const proposal = await creator.propose({
+  name: 'find todos',
+  purpose: 'Find TODO comments in workspace files.',
+});
+
+console.log(proposal.manifest.name, proposal.sha256, proposal.smoke.ok);
+const installed = await creator.install(proposal, { approvedBy: 'me' });
+```
+
+`generate` receives `{ system, user, attempt, issues? }`; `issues` is present
+only on a retry. The repair paragraph names every lint issue. `propose()`
+writes only under `proposalDir` (default `<workspace>/.z2q/proposals`), never
+into `toolsDir`. `install()` is the only path that writes installed tools; it is
+an explicit human decision, passes the proposal's sha256 by default, and refuses
+a bundle changed after the smoke test. `workspace` is also the smoke-test
+workspace, so use a dedicated test directory. A caller signal aborts a pending
+model call; it cannot interrupt the synchronous QuickJS smoke test, and an abort
+during that step is reported when it returns.
+
 ## Manifest
 
 ```json

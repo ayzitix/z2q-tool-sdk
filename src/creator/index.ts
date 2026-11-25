@@ -7,13 +7,12 @@
  */
 
 export {
-  ToolCreatorError,
   buildToolPrompt,
   isValidToolName,
   normalizeToolName,
   resolveToolRequest,
 } from './prompt.js';
-export type { ToolCreatorCode, ToolPrompt, ToolRequest } from './prompt.js';
+export type { ToolPrompt, ToolRequest } from './prompt.js';
 
 export { CREATOR_LIMITS, reviewToolSource, verifyToolSource } from './review.js';
 export type { ToolSourceIssue, ToolSourceReport } from './review.js';
@@ -37,3 +36,14 @@ export type { ApprovalRecord, InstallToolOptions, InstalledTool } from './instal
 
 export { describeCapabilities } from './capabilities.js';
 export type { CapabilityRisk, CapabilitySummary } from './capabilities.js';
+
+export { ToolCreator, ToolCreatorError, createToolCreator } from './flow.js';
+export type {
+  ToolCreatorCode,
+  ToolCreatorErrorConstructor,
+  ToolCreatorErrorOptions,
+  ToolCreatorGenerate,
+  ToolCreatorModelRequest,
+  ToolCreatorOptions,
+  ToolProposal,
+} from './flow.js';
