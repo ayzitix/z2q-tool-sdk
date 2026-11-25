@@ -15,8 +15,9 @@ Inside the VM a tool can reach exactly these globals, measured by
 
 - `globalThis.__z1_invoke(kind, payloadJson)` — the only host function. `kind` is
   one of `fs.read`, `fs.write`, `fs.list`, `fs.glob`, `fs.grep`, `process.run`,
-  `net.fetch` (always refused), `log`. Every payload and every reply is limited
-  to 1 MiB; larger reads, writes and results are chunked, never sent whole.
+  `net.fetch`, `env.read`, `log`. Every payload and every reply is limited to
+  1 MiB; larger reads, writes, response bodies and results are chunked, never
+  sent whole.
 - `globalThis.__z1_args` and `globalThis.__z1_workspace` — two strings.
 - `globalThis.__z1_ctx` — the `ToolContext` the shim builds over the bridge.
 - `globalThis.__z1_run(argsJson)` — the entry point the host calls once.
@@ -31,9 +32,11 @@ That list is the whole surface. If a review finds another name, it is a
 regression.
 
 There is no `process`, no `require`, no `fetch`, no timers, no `std`/`os`
-modules, no `Buffer`, and no network. Module loading is limited to the bundle
-itself: any other request (including every Node builtin) is refused when the
-loader is asked for it, with an `invalid_tool` error naming the module.
+modules and no `Buffer`. The network is reachable **only** through
+`ctx.net.fetch`, which the host validates and relays; the VM itself has no
+socket API. Module loading is limited to the bundle itself: any other request
+(including every Node builtin) is refused when the loader is asked for it, with
+an `invalid_tool` error naming the module.
 
 ## Capability policy
 
@@ -107,6 +110,12 @@ code.
 | Bundle | 8 MiB | `loadToolPackage` |
 | Job pump | 100 000 pending jobs | `loop_limit` |
 | Audit rows | 1 000 per call, then one `audit_limit` row | audit collector |
+| Net body | 4 MiB per response, then `output_too_large` | relay helper, before it crosses the bridge |
+| Net request | 1 MiB per request body | broker, and the 1 MiB bridge cap before it |
+| Net headers | 64 per request | broker |
+| Net redirects | 5 hops | broker, one validated request per hop |
+| Net time | 15 s default, never past the call deadline | helper's `AbortSignal.timeout` + `spawnSync` timeout |
+| Env names | 32 per manifest | `defineTool` and the broker |
 
 `setInterruptHandler` stops busy loops. A tool that awaits a promise that can
 never settle is caught by the pump loop and fails with `loop_limit`. The deadline
@@ -145,11 +154,80 @@ pins the code and the fact that it can overrun, never a tight bound.
 
 ## Network
 
-v1 implements no `net.fetch`. The VM bridge is a single synchronous JSON
-function, and a fetch is not synchronous; `ctx.net.fetch` therefore always fails
-with `net_not_supported`, and `createToolRuntime({ net: { hosts } })` is refused
-at creation. The z1 host performs network access outside the sandbox, where it
-can apply its own allow-list.
+`ctx.net.fetch` is implemented, but not in the VM. The bridge is one synchronous
+JSON function and a fetch is not synchronous, so the broker spawns the **same
+Node binary** with an inline ESM helper (`node --input-type=module -e …`), blocks
+the host thread on it, and returns the decoded hop. Nothing ambient reaches that
+child: its environment is `{}`, its stdin is the one request, its stdout is the
+one reply, and it exits 0 even for a failed request so the failure travels in the
+JSON instead of stderr. No `curl`, no shell, no new dependency.
+
+### What is enforced
+
+1. **Scheme.** `http:` and `https:` only. `file:`, `data:`, `ftp:` and every
+   other scheme are refused as `invalid_arguments` before a socket exists, as is
+   a URL carrying `user:pass@` (those credentials would travel as a header the
+   audit cannot see) and a URL with a NUL byte or over 2048 characters.
+2. **Host, on every hop.** `capabilities.net.hosts` is the allow-list: exact
+   names, `*.example.com` (the apex and any subdomain) or `*` (any host — the
+   product decision a host makes when it grants full network access). An IP
+   literal is allowed only when listed verbatim or through `*`. When the host
+   passes `createToolRuntime({ net: { hosts } })`, the URL host must be covered
+   by **both** lists; `net: false` fails every call with `net_disabled`.
+3. **Redirects.** The helper uses `redirect: 'manual'` and reports `location`;
+   the broker resolves it against the current URL, validates the new host, and
+   only then issues the next request. A redirect to a host the manifest does not
+   list is refused as `net_denied` **before** the second request, so a denied
+   host never sees even a connection. At most 5 redirects are followed; a sixth
+   fails with `net_failed`. `303` becomes a `GET` and drops the body, `301`/`302`
+   turn a `POST` into a `GET` the same way, and `307`/`308` keep method and body.
+4. **Method.** `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, upper-
+   cased. Anything else is `invalid_arguments`.
+5. **Headers.** At most 64. `host`, `content-length`, `transfer-encoding`,
+   `connection` and `upgrade` are refused (`invalid_arguments`) rather than
+   dropped, because a tool must not believe it sent something it did not. Every
+   name and value must be a non-empty string with no CR, LF or NUL, so a value
+   cannot split the header block.
+6. **Size.** A response body over 4 MiB is cancelled in the relay and fails with
+   `output_too_large`; a request body over 1 MiB is `invalid_arguments`. The
+   bridge's own 1 MiB cap already refuses a larger payload first.
+7. **Time.** One fetch gets `min(SANDBOX_DEFAULT_NET_TIMEOUT_MS, remaining call
+   budget)` and the relay reserves a small slice of that so the helper's own
+   `AbortSignal.timeout` fires first: the tool sees `net_failed`, not the call's
+   `time_limit`. The child is always killed at the call deadline.
+8. **Audit and logs.** A `net.fetch` allow row carries the URL; a denial row
+   carries `<redacted>`, so the query string of a refused request — which can
+   hold exactly the credential the tool could not send — never lands in a sink.
+   `env.read` rows carry the granted names, never a value. In every log line and
+   every refusal message, a resolved secret value of 8+ characters is replaced
+   with `[redacted]`.
+
+### What is not enforced
+
+- **No TLS pinning, no certificate opinion, no content inspection.** The relay
+  trusts Node's default trust store, exactly like any other `fetch`.
+- **`'*'` is any host.** A manifest that declares it can reach the whole
+  internet, and the runtime will not stop a tool from sending what it can read.
+  `SECURITY.md`'s rule holds: capabilities are grants, not a filter.
+- **No egress control beyond the host name.** A port and a path are the tool's
+  choice: `net.hosts: ['api.example.com']` also allows `api.example.com:8443`
+  and any path on it. There is no per-path, per-method or per-header policy.
+- **A blocked body is not a blocked response.** The relay reads up to 4 MiB
+  before it gives up; `HEAD` and a 204/304 response have no body at all.
+- **The body is UTF-8.** A binary payload comes back lossy, and the lossy string
+  is what the tool sees and what its result carries.
+- **A body that is mostly escapable characters can hit the relay buffer.**
+  `spawnSync`'s `maxBuffer` is the 4 MiB body cap plus 64 KiB, measured on
+  stdout, where JSON escaping can multiply a body of quotes or backslashes. The
+  call fails with `output_too_large`; it does not corrupt anything.
+- **Secrets live in two heaps while a call runs.** The resolved values are in
+  the host's broker (for masking) and in the VM's `ctx.env` for the duration of
+  the call; `env: false` and `inherit: false` narrow that, and nothing wipes the
+  strings afterwards. A tool can exfiltrate any secret it is granted through any
+  host `net.hosts` allows.
+- **The URL is recorded in the clear.** The audit target of an allowed fetch is
+  the full URL, including its query string, so do not put a secret in a URL the
+  tool is allowed to request.
 
 ## Audit
 
@@ -177,10 +255,11 @@ each part guarantees and what it does not.
   source, never loads it and never touches the filesystem. Its rules are closed
   (rules 1-10 in the README, plus the `scan_failed` lexer outcome): size and
   ESM/`defineTool` shape, allowed imports, forbidden identifiers, a literal
-  `capabilities` object, no `net`, bare `process.argv` names,
-  workspace-relative `fs` grants, the limit ceilings and a literal description
-  of at least 20 characters. Any issue means refuse. It is an advisory lint:
-  passing proves shape, not intent.
+  `capabilities` object, bare `process.argv` names, workspace-relative `fs`
+  grants, the limit ceilings and a literal description of at least 20
+  characters, plus `capability_undeclared` for a `ctx.net.fetch` or
+  `ctx.env.NAME` the declaration does not cover. Any issue means refuse. It is
+  an advisory lint: passing proves shape, not intent.
 - **`buildTool` never imports the bundle on the host.** `src/runtime/definition.ts`
   creates a fresh QuickJS runtime, serves the bundle from a module loader, and
   imports it with no bridge: no `__z1_invoke`, no `__z1_args`, no `console`
@@ -206,7 +285,7 @@ each part guarantees and what it does not.
 - `installTool` always rebuilds when `tool.ts` exists, so a stale `dist/` is
   never signed; a dist-only directory needs `expectSha256` or
   `allowPrebuilt: true`. It recomputes the sha256 with `node:crypto`, refuses a
-  net grant, invalid grants or oversized limits in the manifest, copies exactly
+  invalid grants or oversized limits in the manifest, copies exactly
   `dist/tool.json` and `dist/index.js`, re-reads the copied bytes and the copied
   manifest, writes `approval.json`, and never overwrites a version.
   `expectSha256` / `expectCapabilities` refuse a build different from the one the
@@ -215,8 +294,9 @@ each part guarantees and what it does not.
   and the capabilities against `approval.json` on every load. A tampered bundle
   or `tool.json` is refused.
 - Generated capabilities must be literal declarations. A computed declaration
-  is refused precisely so the decision happens before the build. `net` is
-  refused even with an empty host list. The static ceilings are 32 KiB of
+  is refused precisely so the decision happens before the build. `net` and
+  `env` are read like the other declarations, and a call they do not cover is
+  `capability_undeclared`. The static ceilings are 32 KiB of
   source, `timeoutMs <= 60000`, `maxOutputBytes <= 8388608` and a description of
   at least 20 characters.
 - `describeCapabilities` only reads the manifest: it never grants, opens or

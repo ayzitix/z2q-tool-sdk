@@ -48,6 +48,7 @@ export interface TestFetchCall {
 
 export interface TestFetchResponse {
   status?: number;
+  statusText?: string;
   headers?: Record<string, string>;
   body?: string;
 }
@@ -87,6 +88,11 @@ export interface TestContextOptions {
   commands?: TestCommandRule[];
   /** Fetch handlers. Passing this array enables `ctx.net`. */
   fetches?: TestFetchRule[];
+  /**
+   * Values for `ctx.env`. The harness grants exactly the names you pass, so a
+   * tool that reads an undeclared name sees `undefined`, as it would at run time.
+   */
+  env?: Record<string, string>;
   signal?: AbortSignal;
 }
 
@@ -158,6 +164,16 @@ export function createTestContext(options: TestContextOptions = {}): TestContext
   const signal = options.signal ?? new AbortController().signal;
   const files = new Map(initial);
   const calls: RecordedCall[] = [];
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(options.env ?? {})) {
+    if (typeof value !== 'string') {
+      throw new TypeError(`env["${name}"] must be a string`);
+    }
+    env[name] = value;
+  }
+  // Frozen like the sandbox one: a test that passes only because it could
+  // rewrite `ctx.env` would not describe the real runtime.
+  Object.freeze(env);
 
   const assertNotAborted = (): void => {
     if (signal.aborted) {
@@ -348,6 +364,7 @@ export function createTestContext(options: TestContextOptions = {}): TestContext
     fs: { read, write, list, glob, grep },
     process: { run: runProcess },
     net: { fetch: fetchUrl },
+    env,
     log,
     calls,
     files: () => {
@@ -380,6 +397,11 @@ function normalizeCommandResult(result: TestCommandResult, argv: string[]): Proc
   };
 }
 
+/**
+ * Build the `NetFetchResult` the sandbox would hand the tool, from what a test
+ * handler supplies. `ok`, `text` and `json()` are derived here so a test can
+ * never see a shape the runtime would not produce.
+ */
 function normalizeFetchResponse(
   response: TestFetchResponse,
   url: string,
@@ -391,10 +413,21 @@ function normalizeFetchResponse(
   if (!Number.isInteger(status) || status < 100 || status > 599) {
     throw new TypeError(`test fetch handler for ${url} returned an invalid status`);
   }
+  const body = stringValue(response.body, 'body');
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(response.headers ?? {})) {
+    headers[name.toLowerCase()] = value;
+  }
   return {
+    ok: status >= 200 && status <= 299,
     status,
-    headers: response.headers === undefined ? {} : { ...response.headers },
-    body: stringValue(response.body, 'body'),
+    statusText: stringValue(response.statusText, 'statusText'),
+    url,
+    headers,
+    body,
+    text: body,
+    // Closes over `body`, never `this`: a destructured `json()` must work.
+    json: () => JSON.parse(body) as unknown,
   };
 }
 

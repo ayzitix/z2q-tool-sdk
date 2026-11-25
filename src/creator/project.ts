@@ -310,8 +310,9 @@ describe('${facts.name}', () => {
     expect(tool.manifest.description.length).toBeGreaterThanOrEqual(20);
   });
 
-  it('declares no network access', () => {
-    expect(tool.manifest.capabilities.net.hosts).toEqual([]);
+  it('declares the network and environment grants the review read', () => {
+    expect(tool.manifest.capabilities.net).toEqual({ hosts: ${JSON.stringify(facts.capabilities.net.hosts)} });
+    expect(tool.manifest.capabilities.env).toEqual({ read: ${JSON.stringify(facts.capabilities.env.read)} });
   });
 
   // Add behaviour tests with createTestContext from 'z1-tool-sdk'.
@@ -387,6 +388,7 @@ function emptyCapabilities(): ManifestCapabilities {
     fs: { read: [], write: [] },
     process: { argv: [] },
     net: { hosts: [] },
+    env: { read: [] },
     limits: { timeoutMs: 30_000, maxOutputBytes: 1_048_576 },
   };
 }

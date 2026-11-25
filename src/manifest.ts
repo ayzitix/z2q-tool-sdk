@@ -26,6 +26,7 @@ export function isToolManifest(value: unknown): value is ToolManifest {
     fs?: { read?: unknown; write?: unknown };
     process?: { argv?: unknown };
     net?: { hosts?: unknown };
+    env?: { read?: unknown };
     limits?: { timeoutMs?: unknown; maxOutputBytes?: unknown };
   };
   return (
@@ -33,6 +34,11 @@ export function isToolManifest(value: unknown): value is ToolManifest {
     isStringArray(capabilities.fs?.write) &&
     isStringArray(capabilities.process?.argv) &&
     isStringArray(capabilities.net?.hosts) &&
+    // `env` is newer than `net`: a `tool.json` written before it exists is still
+    // a manifest, and the runtime reads a missing list as "no secrets". An
+    // `env` that is present must have a string `read` array, so a malformed one
+    // is refused rather than silently treated as absent.
+    (capabilities.env === undefined || isStringArray(capabilities.env?.read)) &&
     isPositiveInteger(capabilities.limits?.timeoutMs) &&
     isPositiveInteger(capabilities.limits?.maxOutputBytes)
   );

@@ -431,6 +431,7 @@ function isManifestCapabilities(value: unknown): value is ManifestCapabilities {
     fs?: { read?: unknown; write?: unknown };
     process?: { argv?: unknown };
     net?: { hosts?: unknown };
+    env?: { read?: unknown };
     limits?: { timeoutMs?: unknown; maxOutputBytes?: unknown };
   };
   return (
@@ -438,6 +439,8 @@ function isManifestCapabilities(value: unknown): value is ManifestCapabilities {
     isStringArray(capabilities.fs?.write) &&
     isStringArray(capabilities.process?.argv) &&
     isStringArray(capabilities.net?.hosts) &&
+    // An approval written before `env` existed is still a valid record.
+    (capabilities.env === undefined || isStringArray(capabilities.env?.read)) &&
     isPositiveInteger(capabilities.limits?.timeoutMs) &&
     isPositiveInteger(capabilities.limits?.maxOutputBytes)
   );
@@ -456,6 +459,7 @@ function capabilitiesKey(capabilities: ManifestCapabilities): string {
     fs: { read: [...capabilities.fs.read], write: [...capabilities.fs.write] },
     process: { argv: [...capabilities.process.argv] },
     net: { hosts: [...capabilities.net.hosts] },
+    env: { read: [...capabilities.env.read] },
     limits: {
       timeoutMs: capabilities.limits.timeoutMs,
       maxOutputBytes: capabilities.limits.maxOutputBytes,

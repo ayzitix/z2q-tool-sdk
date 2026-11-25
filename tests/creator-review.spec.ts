@@ -56,6 +56,7 @@ describe('reviewToolSource: the accepted shape', () => {
       fs: { read: ['**/*'], write: [] },
       process: { argv: [] },
       net: { hosts: [] },
+      env: { read: [] },
       limits: { timeoutMs: 30_000, maxOutputBytes: 1_048_576 },
     });
   });
@@ -304,7 +305,9 @@ describe('rule 5: missing_capabilities', () => {
       '  run:',
       "  note: args.path ? 'capabilities' : {},\n  run:",
     );
-    expect(firstCode(reviewToolSource(withNet))).toBe('network_not_supported');
+    const report = reviewToolSource(withNet);
+    expect(report.ok).toBe(true);
+    expect(report.capabilities?.net).toEqual({ hosts: ['api.example.com'] });
 
     const without = toolSource({ capabilities: null }).replace(
       '  run:',
@@ -314,25 +317,59 @@ describe('rule 5: missing_capabilities', () => {
   });
 });
 
-describe('rule 6: network_not_supported', () => {
-  it('refuses net with hosts, and any net declaration at all', () => {
-    const hosted = toolSource({
-      capabilities: "{ net: { hosts: ['api.example.com'] } }",
-    });
-    const report = reviewToolSource(hosted);
-    expect(firstCode(report)).toBe('network_not_supported');
-    expect(report.issues[0]?.line).toBe(9);
-
-    expect(firstCode(reviewToolSource(toolSource({ capabilities: '{ net: {} }' })))).toBe(
-      'network_not_supported',
+describe('rule 6: capability_undeclared', () => {
+  it('reads net.hosts and env.read into the report', () => {
+    const report = reviewToolSource(
+      toolSource({
+        capabilities:
+          "{ net: { hosts: ['api.example.com', '*.example.org'] }, env: { read: ['EXA_API_KEY'] } }",
+        body: "    const r = await ctx.net.fetch(ctx.env.EXA_API_KEY);\n    return { ok: r.ok };",
+      }),
     );
+
+    expect(report.ok).toBe(true);
+    expect(report.capabilities?.net).toEqual({ hosts: ['*.example.org', 'api.example.com'] });
+    expect(report.capabilities?.env).toEqual({ read: ['EXA_API_KEY'] });
   });
 
-  it('treats net: undefined as absent, exactly like defineTool', () => {
-    const report = reviewToolSource(toolSource({ capabilities: '{ net: undefined }' }));
+  it('refuses ctx.net.fetch without net.hosts, naming the line', () => {
+    const report = reviewToolSource(
+      toolSource({
+        body: "    const r = await ctx.net.fetch('https://api.example.com/v1');\n    return { ok: r.ok };",
+      }),
+    );
+    expect(firstCode(report)).toBe('capability_undeclared');
+    expect(report.issues[0]?.message).toContain('capabilities.net.hosts');
+    expect(report.issues[0]?.line).toBe(11);
+  });
+
+  it('refuses ctx.env.NAME without the name in env.read', () => {
+    const undeclared = reviewToolSource(
+      toolSource({
+        capabilities: "{ env: { read: ['EXA_API_KEY'] } }",
+        body: '    return { key: ctx.env.OTHER_KEY };',
+      }),
+    );
+    expect(firstCode(undeclared)).toBe('capability_undeclared');
+    expect(undeclared.issues[0]?.message).toContain('OTHER_KEY');
+
+    const declared = reviewToolSource(
+      toolSource({
+        capabilities: "{ env: { read: ['EXA_API_KEY'] } }",
+        body: '    return { key: ctx.env.EXA_API_KEY };',
+      }),
+    );
+    expect(declared.ok).toBe(true);
+  });
+
+  it('treats net: undefined and env: undefined as absent, exactly like defineTool', () => {
+    const report = reviewToolSource(
+      toolSource({ capabilities: '{ net: undefined, env: undefined }' }),
+    );
 
     expect(report.ok).toBe(true);
     expect(report.capabilities?.net).toEqual({ hosts: [] });
+    expect(report.capabilities?.env).toEqual({ read: [] });
   });
 });
 

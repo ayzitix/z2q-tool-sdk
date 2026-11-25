@@ -99,8 +99,20 @@ export async function smokeTestTool(
     );
   }
 
-  const { createToolRuntime, ToolRuntimeError } = await import('../runtime/index.js');
-  const runtime = await createToolRuntime({ workspace: path.resolve(workspace) });
+  const { createToolRuntime, ToolRuntimeError, loadToolPackage } = await import(
+    '../runtime/index.js'
+  );
+  // The manifest is the gate, and the run passes it through explicitly: the
+  // smoke test declares exactly the hosts and env names the tool declares, so a
+  // sample really reaches the API instead of failing on a default. `env.inherit`
+  // is on, so a declared name resolves from this host's environment; a name the
+  // tool does not declare still never resolves.
+  const pkg = await loadToolPackage(root);
+  const runtime = await createToolRuntime({
+    workspace: path.resolve(workspace),
+    net: { hosts: [...pkg.manifest.capabilities.net.hosts] },
+    env: { inherit: true },
+  });
   const runs: SmokeTestRun[] = [];
   for (const input of inputs) {
     const started = Date.now();
@@ -184,7 +196,8 @@ const DENIAL_CODES = new Set([
   'path_denied',
   'secret_path_denied',
   'process_argv_denied',
-  'net_not_supported',
+  'net_disabled',
+  'net_denied',
 ]);
 
 function isDenialCode(code: string): boolean {

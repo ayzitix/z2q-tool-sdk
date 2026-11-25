@@ -16,6 +16,7 @@ export interface Capabilities {
   fs?: FsCapabilities;
   process?: ProcessCapabilities;
   net?: NetCapabilities;
+  env?: EnvCapabilities;
   limits?: LimitCapabilities;
 }
 
@@ -32,8 +33,20 @@ export interface ProcessCapabilities {
 }
 
 export interface NetCapabilities {
-  /** Host allow-list, for example `["api.github.com"]`. */
+  /**
+   * Host allow-list, for example `["api.github.com"]`. `'*'` means any host;
+   * `'*.example.com'` covers the bare domain and every subdomain. `[]` means no
+   * network at all.
+   */
   hosts?: string[];
+}
+
+export interface EnvCapabilities {
+  /**
+   * Exact environment variable names the tool may read through `ctx.env`.
+   * No globs and no `'*'`: a secret is granted by name or not at all.
+   */
+  read?: string[];
 }
 
 export interface LimitCapabilities {
@@ -48,6 +61,7 @@ export interface ManifestCapabilities {
   fs: { read: string[]; write: string[] };
   process: { argv: string[] };
   net: { hosts: string[] };
+  env: { read: string[] };
   limits: { timeoutMs: number; maxOutputBytes: number };
 }
 
@@ -126,16 +140,36 @@ export interface ProcessRunResult {
 }
 
 export interface NetFetchInit {
+  /** HTTP method, upper-cased by the runtime. Default `GET`. */
   method?: string;
+  /** Request headers. `host`, `content-length` and hop-by-hop names are refused. */
   headers?: Record<string, string>;
+  /** UTF-8 request body. Dropped for `GET`/`HEAD` and on a redirect that becomes one. */
   body?: string;
-  signal?: AbortSignal;
 }
 
+/**
+ * One HTTP response, as the sandbox hands it to a tool.
+ *
+ * `body` and `text` are the same string: `text` exists so `response.text` reads
+ * naturally, `body` so the older name keeps working. The body is decoded as
+ * UTF-8, so a binary payload comes back lossy — request it as text, or read the
+ * bytes some other way.
+ */
 export interface NetFetchResult {
+  /** True for a 2xx status. */
+  ok: boolean;
   status: number;
+  statusText: string;
+  /** The final URL, after every redirect the broker followed. */
+  url: string;
+  /** Response headers, keys lower-cased. */
   headers: Record<string, string>;
   body: string;
+  /** Alias of {@link NetFetchResult.body}, so `response.text` works. */
+  text: string;
+  /** `JSON.parse(body)`; invalid JSON throws `Error('tool_threw: …')`. */
+  json(): unknown;
 }
 
 /**
@@ -161,8 +195,17 @@ export interface ToolContext {
   readonly process: {
     run(options: ProcessRunOptions): Promise<ProcessRunResult>;
   };
+  /**
+   * HTTP(S) only, and only for a host the manifest lists in `net.hosts` and the
+   * runtime does not deny. Every redirect is checked again before it is sent.
+   */
   readonly net: {
     fetch(url: string, init?: NetFetchInit): Promise<NetFetchResult>;
   };
+  /**
+   * Only the names the manifest declares in `env.read`; an ungranted name is
+   * simply absent. Frozen: a tool cannot add or replace an entry.
+   */
+  readonly env: Readonly<Record<string, string>>;
   log(level: LogLevel, message: string): void;
 }

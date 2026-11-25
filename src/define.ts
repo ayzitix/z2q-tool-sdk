@@ -59,11 +59,14 @@ const MAX_DESCRIPTION_LENGTH = 500;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_048_576;
 
-const CAPABILITIES_KEYS = ['fs', 'process', 'net', 'limits'] as const;
+const CAPABILITIES_KEYS = ['fs', 'process', 'net', 'env', 'limits'] as const;
 const FS_KEYS = ['read', 'write'] as const;
 const PROCESS_KEYS = ['argv'] as const;
 const NET_KEYS = ['hosts'] as const;
+const ENV_KEYS = ['read'] as const;
 const LIMIT_KEYS = ['timeoutMs', 'maxOutputBytes'] as const;
+/** The same shape the runtime enforces on `capabilities.env.read`. */
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Validate a tool name. Exported for the CLI's `init` command. */
 export function assertToolName(name: unknown): asserts name is string {
@@ -215,6 +218,9 @@ function resolveCapabilities(input: Capabilities | undefined): ManifestCapabilit
   const net = input.net === undefined ? {} : objectValue(input.net, 'capabilities.net');
   assertOnlyKeys(net, NET_KEYS, 'capabilities.net');
 
+  const env = input.env === undefined ? {} : objectValue(input.env, 'capabilities.env');
+  assertOnlyKeys(env, ENV_KEYS, 'capabilities.env');
+
   const limits =
     input.limits === undefined ? {} : objectValue(input.limits, 'capabilities.limits');
   assertOnlyKeys(limits, LIMIT_KEYS, 'capabilities.limits');
@@ -229,6 +235,9 @@ function resolveCapabilities(input: Capabilities | undefined): ManifestCapabilit
     },
     net: {
       hosts: stringList(net.hosts, 'capabilities.net.hosts'),
+    },
+    env: {
+      read: envNameList(env.read, 'capabilities.env.read'),
     },
     limits: {
       timeoutMs: positiveInteger(limits.timeoutMs, 'capabilities.limits.timeoutMs', DEFAULT_TIMEOUT_MS),
@@ -256,6 +265,26 @@ function stringList(value: unknown, field: string): string[] {
     return item.trim();
   });
   return [...new Set(items)].sort();
+}
+
+/**
+ * `env.read` names are exact identifiers: no globs, no `'*'`, no duplicates.
+ *
+ * This is the authoring half of the runtime's own check (`assertEnvNames` in
+ * `policy.ts`): a definition that asks for every secret with one wildcard is
+ * refused before it can become a manifest.
+ */
+function envNameList(value: unknown, field: string): string[] {
+  const names = stringList(value, field);
+  for (const name of names) {
+    if (!ENV_NAME_PATTERN.test(name)) {
+      throw capabilityError(
+        field,
+        `${field} entry "${name}" must be an environment variable name matching ${ENV_NAME_PATTERN.source}`,
+      );
+    }
+  }
+  return names;
 }
 
 function positiveInteger(value: unknown, field: string, fallback: number): number {

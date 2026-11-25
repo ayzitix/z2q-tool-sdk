@@ -12,7 +12,9 @@ export type ToolRuntimeCode =
   | 'process_argv_denied'
   | 'process_failed'
   | 'process_timeout'
-  | 'net_not_supported'
+  | 'net_disabled'
+  | 'net_denied'
+  | 'net_failed'
   | 'time_limit'
   | 'memory_limit'
   | 'loop_limit'
@@ -31,7 +33,9 @@ export const TOOL_RUNTIME_CODES: readonly ToolRuntimeCode[] = [
   'process_argv_denied',
   'process_failed',
   'process_timeout',
-  'net_not_supported',
+  'net_disabled',
+  'net_denied',
+  'net_failed',
   'time_limit',
   'memory_limit',
   'loop_limit',
@@ -64,7 +68,7 @@ export class ToolRuntimeError extends Error {
   }
 }
 
-/** True when `value` is one of the 17 documented codes. */
+/** True when `value` is one of the 19 documented codes. */
 export function isToolRuntimeCode(value: unknown): value is ToolRuntimeCode {
   return typeof value === 'string' && (TOOL_RUNTIME_CODES as readonly string[]).includes(value);
 }

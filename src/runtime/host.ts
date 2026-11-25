@@ -60,9 +60,36 @@ export interface HostExecError {
   readonly message: string;
 }
 
+export interface HostSpawnOptions {
+  /** Written to the child's stdin, then the pipe is closed. */
+  input: string;
+  encoding: 'utf8';
+  /** Wall-clock budget; Node kills the child with SIGTERM when it runs out. */
+  timeout: number;
+  maxBuffer: number;
+  windowsHide: boolean;
+  /** The child's whole environment, passed as given: nothing is inherited. */
+  env: Record<string, string>;
+}
+
+export interface HostSpawnResult {
+  readonly status: number | null;
+  readonly signal: string | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  /** Spawn failure, non-zero exit or timeout, exactly as Node reports it. */
+  readonly error?: HostExecError;
+}
+
 export interface HostChildProcess {
   /** `execFileSync` in argv form, never a shell string. */
   execFileSync(file: string, args: readonly string[], options: HostExecOptions): string;
+  /**
+   * `spawnSync` in argv form: it blocks the host thread until the child exits,
+   * which is the whole point of the network relay (the VM bridge is
+   * synchronous, so a fetch has to block too).
+   */
+  spawnSync(file: string, args: readonly string[], options: HostSpawnOptions): HostSpawnResult;
 }
 
 export interface HostCrypto {
@@ -74,6 +101,8 @@ export interface RuntimeHost {
   readonly path: HostPath;
   readonly childProcess: HostChildProcess;
   readonly crypto: HostCrypto;
+  /** The Node binary running the host: the network relay spawns exactly this. */
+  readonly execPath: string;
   /** `win32` compares paths and executable names case-insensitively. */
   readonly caseInsensitive: boolean;
 }
@@ -145,6 +174,26 @@ async function load(): Promise<RuntimeHost> {
         stdio: ['ignore', 'pipe', 'pipe'],
         ...(options.stdin === undefined ? {} : { input: options.stdin }),
       }),
+    spawnSync: (file, args, options) => {
+      const result = childProcessModule.spawnSync(file, [...args], {
+        input: options.input,
+        encoding: options.encoding,
+        timeout: options.timeout,
+        maxBuffer: options.maxBuffer,
+        windowsHide: options.windowsHide,
+        // The helper gets this object and nothing else: no PATH, no HOME, no
+        // NODE_OPTIONS and no secret the host holds. `env: {}` is the point.
+        env: options.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      return {
+        status: result.status,
+        signal: result.signal,
+        stdout: typeof result.stdout === 'string' ? result.stdout : '',
+        stderr: typeof result.stderr === 'string' ? result.stderr : '',
+        ...(result.error === undefined ? {} : { error: result.error }),
+      };
+    },
   };
 
   const crypto: HostCrypto = {
@@ -156,6 +205,7 @@ async function load(): Promise<RuntimeHost> {
     path,
     childProcess,
     crypto,
+    execPath: process.execPath,
     caseInsensitive: process.platform === 'win32',
   };
   loaded = host;

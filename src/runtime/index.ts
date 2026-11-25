@@ -23,11 +23,17 @@ export type { AuditRow, AuditSink } from './audit.js';
 export { loadToolPackage } from './package.js';
 export type { ToolPackage } from './package.js';
 export {
+  SANDBOX_DEFAULT_NET_TIMEOUT_MS,
   SANDBOX_MAX_AUDIT_ROWS,
   SANDBOX_MAX_BRIDGE_BYTES,
   SANDBOX_MAX_BUNDLE_BYTES,
+  SANDBOX_MAX_ENV_ENTRIES,
   SANDBOX_MAX_GLOB_RESULTS,
   SANDBOX_MAX_GREP_MATCHES,
+  SANDBOX_MAX_NET_BODY_BYTES,
+  SANDBOX_MAX_NET_HEADERS,
+  SANDBOX_MAX_NET_REDIRECTS,
+  SANDBOX_MAX_NET_REQUEST_BYTES,
   SANDBOX_MAX_OUTPUT_BYTES,
   SANDBOX_MAX_PUMP_ITERATIONS,
   SANDBOX_MAX_READ_BYTES,
@@ -65,8 +71,28 @@ export interface ToolRuntimeOptions {
     /** Captured stdout/stderr budget for one child. */
     maxOutputBytes?: number;
   };
-  /** v1 only supports `false`: the bridge is synchronous and a fetch is not. */
-  net?: false;
+  /**
+   * Network ceiling for `ctx.net.fetch`.
+   *
+   * `false` disables the network entirely: every call fails with
+   * `net_disabled`, whatever the manifest declares. `undefined` and `true` let
+   * the manifest decide — its `net.hosts` is the allow-list, and `[]` means no
+   * network. `{ hosts }` is an extra ceiling: the URL host must be covered by
+   * the manifest **and** by this list, so a host can grant less than a tool asks
+   * for but never more.
+   */
+  net?: false | true | { hosts?: readonly string[] };
+  /**
+   * Secrets exposed as `ctx.env`, by exact name.
+   *
+   * `false` grants nothing. `env.read` supplies values directly and
+   * `env.inherit` (default `true`) also resolves a declared name from the host
+   * `process.env` **as it was when this runtime was created**; `env.read` wins
+   * over an inherited value. A name the manifest does not declare never
+   * resolves, whatever is passed here — the manifest is the gate, not this
+   * option.
+   */
+  env?: false | { read?: Record<string, string>; inherit?: boolean };
   /** Injectable clock, default `Date.now`. */
   now?: () => number;
   /**
@@ -104,6 +130,12 @@ interface NormalizedOptions {
   readonly processEnv: Record<string, string>;
   readonly processTimeoutMs: number | undefined;
   readonly processMaxOutputBytes: number;
+  readonly netEnabled: boolean;
+  /** Host ceiling over the manifest's hosts; `undefined` means "the manifest decides". */
+  readonly netHosts: readonly string[] | undefined;
+  readonly envEnabled: boolean;
+  /** Every value a declared name may resolve to; only declared names are used. */
+  readonly envSource: Record<string, string>;
   readonly now: () => number;
   readonly onLog: ((level: LogLevel, message: string) => void) | undefined;
 }
@@ -178,6 +210,10 @@ export class ToolRuntime {
         timeoutMs: this.#options.processTimeoutMs,
         maxOutputBytes: processCap,
       },
+      net: { enabled: this.#options.netEnabled, hosts: this.#options.netHosts },
+      // Only the names this manifest declares resolve, and only from the
+      // snapshot taken when the runtime was created; `env: false` empties both.
+      env: { values: resolveEnvValues(manifest.capabilities.env?.read, this.#options) },
       signal,
       host: this.#host,
       ...(this.#options.onLog === undefined ? {} : { onLog: this.#options.onLog }),
@@ -264,13 +300,8 @@ function normalizeOptions(options: ToolRuntimeOptions, host: RuntimeHost): Norma
     throw new ToolRuntimeError('invalid_arguments', `workspace is not a directory: ${resolvedWorkspace}`);
   }
 
-  const net = (options as { net?: unknown }).net;
-  if (net !== undefined && net !== false) {
-    throw new ToolRuntimeError(
-      'net_not_supported',
-      'the sandbox does not implement net.fetch; the z1 host performs network access',
-    );
-  }
+  const net = normalizeNet(options.net);
+  const env = normalizeEnv(options.env);
 
   const processOptions = options.process ?? {};
   const inheritEnv = processOptions.inheritEnv;
@@ -308,9 +339,137 @@ function normalizeOptions(options: ToolRuntimeOptions, host: RuntimeHost): Norma
       SANDBOX_MAX_OUTPUT_BYTES,
       'process.maxOutputBytes',
     ),
+    netEnabled: net.enabled,
+    netHosts: net.hosts,
+    envEnabled: env.enabled,
+    envSource: env.values,
     now: options.now ?? Date.now,
     onLog: options.onLog,
   };
+}
+
+interface NetCeiling {
+  readonly enabled: boolean;
+  readonly hosts: readonly string[] | undefined;
+}
+
+/**
+ * Resolve `net` into "is it on at all" and "does the host add a list".
+ *
+ * `undefined`/`true` mean the manifest alone decides, which is the default the
+ * brief asks for: a tool that declares nothing gets no network, and a host that
+ * wants to restrict further passes `{ hosts }`.
+ */
+function normalizeNet(value: unknown): NetCeiling {
+  if (value === undefined || value === true) return { enabled: true, hosts: undefined };
+  if (value === false) return { enabled: false, hosts: undefined };
+  if (typeof value !== 'object' || value === null) {
+    throw new ToolRuntimeError(
+      'invalid_arguments',
+      'net must be false, true or an object with a hosts array',
+    );
+  }
+  const record = value as { hosts?: unknown };
+  assertOnlyKeys(record, ['hosts'], 'net');
+  if (record.hosts === undefined) return { enabled: true, hosts: undefined };
+  if (!Array.isArray(record.hosts)) {
+    throw new ToolRuntimeError('invalid_arguments', 'net.hosts must be an array of host names');
+  }
+  const hosts = record.hosts.map((host, index) => {
+    if (typeof host !== 'string' || host.trim().length === 0) {
+      throw new ToolRuntimeError(
+        'invalid_arguments',
+        `net.hosts[${index}] must be a non-empty string`,
+      );
+    }
+    if (host.includes('\0')) {
+      throw new ToolRuntimeError('invalid_arguments', `net.hosts[${index}] must not contain NUL`);
+    }
+    return host.trim();
+  });
+  return { enabled: true, hosts };
+}
+
+interface EnvSource {
+  readonly enabled: boolean;
+  readonly values: Record<string, string>;
+}
+
+/**
+ * Resolve `env` into "is it on at all" and a snapshot of the values a declared
+ * name may resolve to.
+ *
+ * The snapshot is taken here, when the runtime is created, on purpose: a tool
+ * call must not see a secret that appeared after the host approved the runtime,
+ * and it must not see one that was revoked. `env: false` grants nothing;
+ * `env.read` wins over an inherited value.
+ */
+function normalizeEnv(value: unknown): EnvSource {
+  if (value === undefined) return { enabled: true, values: readProcessEnv() };
+  if (value === false) return { enabled: false, values: {} };
+  if (typeof value !== 'object' || value === null) {
+    throw new ToolRuntimeError(
+      'invalid_arguments',
+      'env must be false or an object with read and inherit',
+    );
+  }
+  const record = value as { read?: unknown; inherit?: unknown };
+  assertOnlyKeys(record, ['read', 'inherit'], 'env');
+  if (record.inherit !== undefined && typeof record.inherit !== 'boolean') {
+    throw new ToolRuntimeError('invalid_arguments', 'env.inherit must be a boolean');
+  }
+  return {
+    enabled: true,
+    values: {
+      ...(record.inherit === false ? {} : readProcessEnv()),
+      ...envReadValues(record.read),
+    },
+  };
+}
+
+/** Validate `env.read`: a plain object of string values, never an array. */
+function envReadValues(value: unknown): Record<string, string> {
+  if (value === undefined) return {};
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new ToolRuntimeError('invalid_arguments', 'env.read must be an object of strings');
+  }
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== 'string') {
+      throw new ToolRuntimeError('invalid_arguments', `env.read.${key} must be a string`);
+    }
+    out[key] = item;
+  }
+  return out;
+}
+
+function assertOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string,
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      throw new ToolRuntimeError(
+        'invalid_arguments',
+        `${label}.${key} is not supported (${allowed.join(', ')})`,
+      );
+    }
+  }
+}
+
+/** The values the manifest's declared names resolve to, and nothing else. */
+function resolveEnvValues(
+  declared: readonly string[] | undefined,
+  options: NormalizedOptions,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  if (!options.envEnabled) return values;
+  for (const name of declared ?? []) {
+    const value = options.envSource[name];
+    if (typeof value === 'string') values[name] = value;
+  }
+  return values;
 }
 
 function positiveInteger(value: unknown, fallback: number, field: string): number {

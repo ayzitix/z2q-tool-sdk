@@ -46,6 +46,7 @@ describe('defineTool', () => {
         fs: { read: [], write: [] },
         process: { argv: [] },
         net: { hosts: [] },
+        env: { read: [] },
         limits: { timeoutMs: 30_000, maxOutputBytes: 1_048_576 },
       },
     });
@@ -86,6 +87,7 @@ describe('defineTool', () => {
         fs: { read: ['b/**', 'a/**', 'a/**'], write: ['out/**'] },
         process: { argv: ['adb', 'adb'] },
         net: { hosts: ['example.com'] },
+        env: { read: ['EXA_API_KEY', 'EXA_API_KEY', 'HOME'] },
       },
     });
 
@@ -93,6 +95,7 @@ describe('defineTool', () => {
       fs: { read: ['a/**', 'b/**'], write: ['out/**'] },
       process: { argv: ['adb'] },
       net: { hosts: ['example.com'] },
+      env: { read: ['EXA_API_KEY', 'HOME'] },
       limits: { timeoutMs: 30_000, maxOutputBytes: 1_048_576 },
     });
   });

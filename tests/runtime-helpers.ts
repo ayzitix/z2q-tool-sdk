@@ -70,13 +70,16 @@ export function capabilities(overrides: {
   read?: string[];
   write?: string[];
   argv?: string[];
+  hosts?: string[];
+  envRead?: string[];
   timeoutMs?: number;
   maxOutputBytes?: number;
 } = {}): ManifestCapabilities {
   return {
     fs: { read: overrides.read ?? [], write: overrides.write ?? [] },
     process: { argv: overrides.argv ?? [] },
-    net: { hosts: [] },
+    net: { hosts: overrides.hosts ?? [] },
+    env: { read: overrides.envRead ?? [] },
     limits: {
       timeoutMs: overrides.timeoutMs ?? 30_000,
       maxOutputBytes: overrides.maxOutputBytes ?? 1_048_576,
@@ -91,6 +94,8 @@ export function rawManifest(overrides: {
   read?: string[];
   write?: string[];
   argv?: string[];
+  hosts?: string[];
+  envRead?: string[];
 } = {}): ToolManifest {
   return {
     schemaVersion: 1,
@@ -102,6 +107,8 @@ export function rawManifest(overrides: {
       ...(overrides.read === undefined ? {} : { read: overrides.read }),
       ...(overrides.write === undefined ? {} : { write: overrides.write }),
       ...(overrides.argv === undefined ? {} : { argv: overrides.argv }),
+      ...(overrides.hosts === undefined ? {} : { hosts: overrides.hosts }),
+      ...(overrides.envRead === undefined ? {} : { envRead: overrides.envRead }),
       ...(overrides.limits?.timeoutMs === undefined ? {} : { timeoutMs: overrides.limits.timeoutMs }),
       ...(overrides.limits?.maxOutputBytes === undefined
         ? {}
