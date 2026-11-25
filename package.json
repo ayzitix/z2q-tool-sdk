@@ -1,0 +1,60 @@
+{
+  "name": "z1-tool-sdk",
+  "version": "0.1.0",
+  "description": "Author z1 tools declaratively: typed definitions, capabilities, a test harness, and a build CLI.",
+  "author": "ayzitix",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ayzitix/z1-tool-sdk.git"
+  },
+  "homepage": "https://github.com/ayzitix/z1-tool-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/ayzitix/z1-tool-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "z1-tool": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "z1",
+    "tools",
+    "sdk",
+    "agents"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --external:esbuild --outfile=dist/cli.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12"
+  }
+}
