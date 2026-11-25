@@ -273,6 +273,46 @@ describe('createToolCreator: install and defaults', () => {
     expect(detailsOf(again).code).toBe('version_exists');
   });
 
+  it('refuses malformed options and a signal that is not an AbortSignal', async () => {
+    const workspace = await tempDir('z2q-flow-options-');
+    const creator = creatorFor(workspace, stub([sourceFor()]));
+
+    const nullOptions = await rejection(creator.propose(request(), null as never));
+    expect(nullOptions.code).toBe('invalid_request');
+
+    const badSignal = await rejection(
+      creator.propose(request(), { signal: {} as AbortSignal }),
+    );
+    expect(badSignal.code).toBe('invalid_request');
+    expect(badSignal.message).toContain('AbortSignal');
+  });
+
+  it('treats expectSha256 as a stricter expectation, not an override', async () => {
+    const workspace = await tempDir('z2q-flow-expect-');
+    const creator = creatorFor(workspace, stub([sourceFor()]));
+    const proposal = await creator.propose(request());
+
+    const mismatch = await rejection(
+      creator.install(proposal, { expectSha256: 'a'.repeat(64) }),
+    );
+    expect(mismatch.code).toBe('install_failed');
+    expect(detailsOf(mismatch).code).toBe('sha_mismatch');
+
+    const installed = await creator.install(proposal, { expectSha256: proposal.sha256 });
+    expect(installed.sha256).toBe(proposal.sha256);
+  });
+
+  it('reports a renamed tool as a review failure with a name_mismatch issue', async () => {
+    const workspace = await tempDir('z2q-flow-rename-');
+    const creator = creatorFor(workspace, stub([sourceFor('return { ok: true };', 'tool.other')]));
+
+    const error = await rejection(creator.propose(request()));
+
+    expect(error.code).toBe('review_failed');
+    expect(error.issues?.[0]?.code).toBe('name_mismatch');
+    expect(error.message).toContain('tool.other');
+  });
+
   it('keeps proposalDir and toolsDir lazy under the default .z2q root', async () => {
     const workspace = await tempDir('z2q-flow-defaults-');
     const creator = creatorFor(workspace, stub([sourceFor()]));

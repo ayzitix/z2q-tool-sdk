@@ -155,7 +155,22 @@ export class ToolCreator {
     request: ToolRequest,
     options: { signal?: AbortSignal } = {},
   ): Promise<ToolProposal> {
+    if (!isRecord(options)) {
+      throw flowError('invalid_request', 'propose options must be an object', {
+        details: { field: 'options' },
+      });
+    }
     const signal = options.signal;
+    if (
+      signal !== undefined &&
+      (typeof signal !== 'object' ||
+        signal === null ||
+        typeof (signal as AbortSignal).addEventListener !== 'function')
+    ) {
+      throw flowError('invalid_request', 'propose options.signal must be an AbortSignal', {
+        details: { field: 'signal' },
+      });
+    }
     checkAbort(signal, 'before the first attempt');
 
     const resolved = resolveToolRequest(request);
@@ -230,6 +245,17 @@ export class ToolCreator {
         source: finalSource,
       });
     } catch (error) {
+      if (
+        error instanceof ToolCreatorError &&
+        (error as { code?: string }).code === 'name_mismatch'
+      ) {
+        // A model that renames the tool is a review problem, not a build crash:
+        // the host reads `issues` to decide whether to retry.
+        throw flowError('review_failed', messageOf(error), {
+          issues: [{ code: 'name_mismatch', message: messageOf(error), line: 1 }],
+          cause: error,
+        });
+      }
       throw flowError('build_failed', `project build failed: ${messageOf(error)}`, {
         cause: error,
       });
@@ -284,9 +310,12 @@ export class ToolCreator {
   /**
    * Install a proposal behind `approval.json`.
    *
-   * The default `expectSha256` is the proposal's hash. Before delegating, the
-   * current `dist/index.js` is re-hashed: a proposal changed after its smoke test
-   * is refused instead of being silently rebuilt by `installTool`.
+   * The proposal's sha256 is authoritative: it is the artefact the smoke test
+   * ran. `expectSha256` is a second expectation and can only tighten — a value
+   * that differs from the proposal's is refused instead of overriding it. Before
+   * delegating, the current `dist/index.js` is re-hashed: a proposal changed
+   * after its smoke test is refused instead of being silently rebuilt by
+   * `installTool`.
    */
   async install(
     proposal: ToolProposal,
@@ -296,6 +325,20 @@ export class ToolCreator {
       throw flowError('install_failed', 'install requires a proposal made by propose()', {
         details: { code: 'invalid_arguments' },
       });
+    }
+    if (!isRecord(options)) {
+      throw flowError('install_failed', 'install options must be an object', {
+        details: { code: 'invalid_arguments' },
+      });
+    }
+    if (options.expectSha256 !== undefined && options.expectSha256 !== proposal.sha256) {
+      // The proposal's hash is authoritative: it is the artefact the smoke test
+      // ran. `expectSha256` is a second, stricter expectation, not an override.
+      throw flowError(
+        'install_failed',
+        `sha_mismatch: the caller expects ${String(options.expectSha256)}, but the proposal was smoke-tested as ${proposal.sha256}`,
+        { details: { code: 'sha_mismatch' } },
+      );
     }
 
     const path = await import('node:path');
@@ -400,7 +443,9 @@ export class ToolCreator {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       if (signal !== undefined && onAbort !== undefined) {
-        signal.removeEventListener('abort', onAbort);
+        if (typeof signal.removeEventListener === 'function') {
+          signal.removeEventListener('abort', onAbort);
+        }
       }
     }
   }
