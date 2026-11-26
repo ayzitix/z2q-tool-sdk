@@ -347,14 +347,17 @@ describe('describeCapabilities', () => {
     networkManifest.capabilities.net.hosts = ['api.example.com'];
     const network = describeCapabilities(networkManifest);
     expect(network.risk).toBe('network');
-    expect(network.lines[0]).toContain('net hosts: "api.example.com"');
+    expect(network.lines[0]).toContain('Fetches from these hosts');
+    expect(network.lines[0]).toContain('"api.example.com"');
     expect(network.lines[0]).toContain('ctx.net.fetch');
 
     const secrets = rawManifest();
     secrets.capabilities.env.read = ['EXA_API_KEY'];
     const env = describeCapabilities(secrets);
-    expect(env.risk).toBe('read-only');
-    expect(env.lines[0]).toContain('env read: "EXA_API_KEY"');
+    expect(env.risk).toBe('secrets');
+    expect(env.lines[0]).toContain('Reads these environment variables');
+    expect(env.lines[0]).toContain('"EXA_API_KEY"');
+    expect(env.lines[0]).toContain('can leave in a request or a result');
   });
 
   it('describes a tool with no grants and keeps quoted values on one line', () => {

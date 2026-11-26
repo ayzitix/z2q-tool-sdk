@@ -155,7 +155,9 @@ env: { read: ['EXA_API_KEY'] } - exact environment variable names for ctx.env. N
 - No Node builtins, no global fetch, no timers, no global state. Use ctx for the network
   and for secrets, and declare every host and name you use.
 - Keep the whole file under 32 KiB.
-- The tool must be deterministic and return JSON-serializable values.`;
+- Return JSON-serializable values. Beyond its arguments, the only inputs the tool may read
+  are the ctx.net hosts and ctx.env names it declares: a declared fetch or variable is
+  allowed to make a result vary, so do not claim determinism the grants contradict.`;
 
 /**
  * Normalise a requested name. A valid name is returned unchanged; anything else

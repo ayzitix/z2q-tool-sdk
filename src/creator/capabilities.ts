@@ -1,7 +1,14 @@
 import type { ManifestCapabilities, ToolManifest } from '../types.js';
 
-/** The risk class an approval prompt shows. Ordered by severity. */
-export type CapabilityRisk = 'read-only' | 'writes' | 'runs-programs' | 'network';
+/**
+ * The risk class an approval prompt shows. Ordered by severity.
+ *
+ * `secrets` sits above `writes` because reading a declared environment variable
+ * is how a tool gets a credential: calling that `read-only` told a person the
+ * least dangerous thing about the most sensitive grant, and the model relays the
+ * class to the user in the `tool.create` result.
+ */
+export type CapabilityRisk = 'read-only' | 'writes' | 'secrets' | 'runs-programs' | 'network';
 
 /** A human-readable capability summary for an approval prompt. */
 export interface CapabilitySummary {
@@ -35,10 +42,14 @@ export function describeCapabilities(manifest: ToolManifest): CapabilitySummary 
     );
   }
   if (capabilities.net.hosts.length > 0) {
-    lines.push(`Requests network access to net hosts: ${quoted(capabilities.net.hosts)} through ctx.net.fetch.`);
+    lines.push(
+      `Fetches from these hosts through ctx.net.fetch: ${quoted(capabilities.net.hosts)}.`,
+    );
   }
   if (capabilities.env.read.length > 0) {
-    lines.push(`Reads the environment variables env read: ${quoted(capabilities.env.read)}.`);
+    lines.push(
+      `Reads these environment variables: ${quoted(capabilities.env.read)}. A value read here can leave in a request or a result.`,
+    );
   }
   if (lines.length === 0) {
     lines.push('No filesystem, process, network or environment grants.');
@@ -55,6 +66,7 @@ export function describeCapabilities(manifest: ToolManifest): CapabilitySummary 
 function riskOf(capabilities: ManifestCapabilities): CapabilityRisk {
   if (capabilities.net.hosts.length > 0) return 'network';
   if (capabilities.process.argv.length > 0) return 'runs-programs';
+  if (capabilities.env.read.length > 0) return 'secrets';
   if (capabilities.fs.write.length > 0) return 'writes';
   return 'read-only';
 }
