@@ -7,8 +7,10 @@ import { SANDBOX_MAX_BRIDGE_BYTES, SANDBOX_MAX_READ_BYTES } from './limits.js';
  * Three scripts are evaluated once per call, after the host function and globals
  * are installed:
  *
- * - {@link SHIM_SOURCE} builds `globalThis.__z1_ctx`, a `ToolContext` over
- *   `__z1_invoke`, and maps `console.*` onto `log`.
+ * - {@link buildShimSource} builds `globalThis.__z1_ctx`, a `ToolContext` over
+ *   `__z1_invoke`, and maps `console.*` onto `log`. It is a function, not a
+ *   constant, because one thing about the call has to be baked into the source:
+ *   whether the manifest declares any `env.read` name (see {@link ShimOptions}).
  * - {@link ENTRY_SOURCE} builds `globalThis.__z1_run`, the async entry point the
  *   host calls with the arguments as a JSON string, and `globalThis.__z1_encode`.
  * - The host then calls `__z1_encode(offset, length)` repeatedly, after the entry
@@ -22,12 +24,31 @@ import { SANDBOX_MAX_BRIDGE_BYTES, SANDBOX_MAX_READ_BYTES } from './limits.js';
  * other side, so no single crossing goes near the trigger.
  */
 
+/** What the shim has to know about this call before the VM starts. */
+export interface ShimOptions {
+  /**
+   * True when the manifest declares at least one `env.read` name.
+   *
+   * With no declared name `ctx.env` can only ever be `{}`, so the shim builds
+   * that empty frozen object without a bridge call: one crossing and one audit
+   * row fewer per call, and nothing a tool could learn from the round trip. A
+   * declaration is what pays for the call — including a hand-written `tool.json`
+   * asking for `'*'`, which must still reach `assertEnvNames` and be refused,
+   * rather than silently look like a grant that resolved to nothing.
+   */
+  readonly env: boolean;
+}
+
 /** Builds `globalThis.__z1_ctx`, a `ToolContext` over `__z1_invoke`. */
-export const SHIM_SOURCE = String.raw`(function () {
+export function buildShimSource(options: ShimOptions): string {
+  return String.raw`(function () {
   'use strict';
 
   var BRIDGE_LIMIT = ${SANDBOX_MAX_BRIDGE_BYTES};
   var READ_LIMIT = ${SANDBOX_MAX_READ_BYTES};
+  // Baked in, not fetched: a manifest that declares no name needs no crossing,
+  // and the VM has no other way to learn what the manifest said.
+  var ENV_DECLARED = ${options.env ? 'true' : 'false'};
   // 128 KiB per read chunk. 1 MiB pieces of text outside Latin-1 still abort at
   // dispose; measured clean at 128 KiB for the same content, and ASCII is clean
   // at 1 MiB, so the smaller request buys the 16-bit path for a few crossings.
@@ -249,13 +270,18 @@ export const SHIM_SOURCE = String.raw`(function () {
    * ctx.env: exactly the names the manifest declares, in one call.
    *
    * An undeclared name is simply absent, so ctx.env.X is undefined without a
-   * second crossing. A refusal here (a hand-written tool.json asking for "*")
-   * fails the call instead of silently granting nothing: a declaration the
-   * runtime could not read must not look like one it honoured.
+   * second crossing. A manifest that declares no name at all is answered here,
+   * without a call: there is nothing to ask for, and an env.read row for a
+   * grant nobody made is noise in the audit trail.
+   *
+   * A refusal (a hand-written tool.json asking for "*") fails the call instead
+   * of silently granting nothing: a declaration the runtime could not read must
+   * not look like one it honoured.
    */
   function readEnv() {
-    var reply = call('env.read', {});
     var values = {};
+    if (!ENV_DECLARED) return Object.freeze(values);
+    var reply = call('env.read', {});
     if (
       reply === null ||
       typeof reply !== 'object' ||
@@ -330,6 +356,7 @@ export const SHIM_SOURCE = String.raw`(function () {
   };
 })();
 `;
+}
 
 /**
  * Builds `globalThis.__z1_run` (import, validate, call, stash) and

@@ -64,10 +64,10 @@ describe('audit rows', () => {
       expect(denied).toMatch(/^(secret_path_denied|path_denied|process_argv_denied|net_denied): /);
     }
 
-    // Every call opens with the one `env.read` its `ctx.env` is built from; this
-    // manifest declares no names, so the row carries the kind as its target.
+    // This manifest declares no `env.read` name, so the call opens with no
+    // `env.read` row: the shim only asks when the declaration has something in
+    // it (the env spec covers the row a declaration does produce).
     expect(result.audit.map((row) => [row.kind, row.decision, row.code ?? null, row.target])).toEqual([
-      ['env.read', 'allow', null, 'env.read'],
       ['fs.read', 'allow', null, 'a.txt'],
       ['fs.read', 'deny', 'secret_path_denied', '<redacted>'],
       ['fs.read', 'deny', 'path_denied', '.git/config'],
@@ -137,7 +137,6 @@ describe('audit rows', () => {
     const result = await runtime.run(fixture.dir, {});
     expect(result.value).toEqual({ text: 'FILE-CONTENT-MARKER' });
     expect(result.audit.map((row) => [row.kind, row.decision])).toEqual([
-      ['env.read', 'allow'],
       ['fs.read', 'allow'],
     ]);
     expect(warnings).toEqual(['warn:the audit sink threw and was ignored: sink is on fire']);
@@ -153,8 +152,10 @@ describe('audit rows', () => {
 
     await runtime.run(fixture.dir, {});
     const lines = (await readFile(file, 'utf8')).trim().split('\n');
-    expect(lines).toHaveLength(2);
-    const row = JSON.parse(lines[1] ?? '{}') as AuditRow;
+    // One row, for the one bridged call: the manifest declares no env name, so
+    // building `ctx.env` costs no `env.read` row.
+    expect(lines).toHaveLength(1);
+    const row = JSON.parse(lines[0] ?? '{}') as AuditRow;
     expect(row).toMatchObject({ kind: 'fs.read', decision: 'allow', target: 'a.txt' });
   });
 

@@ -228,6 +228,10 @@ export class ToolRuntime {
         argsJson,
         workspace: this.#options.workspace,
         tool,
+        // A manifest that declares no env name gets an empty frozen `ctx.env`
+        // without a bridge call; a declared one — including a hand-written `'*'`
+        // — pays for the call, so the refusal still reaches the tool.
+        envDeclared: (manifest.capabilities.env?.read?.length ?? 0) > 0,
         memoryBytes: this.#options.memoryBytes,
         deadline,
         now: this.#options.now,

@@ -38,7 +38,13 @@ export interface NetRelayResult {
  *
  * Contract with {@link relayFetch}:
  *
- * - stdin is one JSON object `{ url, method, headers, body, maxBodyBytes, timeoutMs }`;
+ * - stdin is one JSON object `{ url, method, headers, body, maxBodyBytes,
+ *   maxTimeoutMs, abortAt }`;
+ * - the abort is **wall-clock**, not a duration counted from the helper's own
+ *   start: `abortAt` is the instant the host computed (`now + budget - margin`),
+ *   so a slow Node start-up eats into the request window instead of pushing the
+ *   abort past the call's deadline (measured: a loaded host otherwise reports
+ *   the call's `time_limit` instead of `net_failed`);
  * - `redirect: 'manual'` on purpose: the broker validates **every** hop, so the
  *   helper reports `location` instead of following it;
  * - the body is read through `response.body.getReader()` and the read stops at
@@ -62,11 +68,15 @@ function emit(payload) {
 }
 
 try {
+  // Anchored to the host's instant, never to "now + duration": this process
+  // starts after the budget is already counting down.
+  const wallMs = input.abortAt - Date.now();
+  const timeoutMs = Math.max(1, Math.min(input.maxTimeoutMs, wallMs));
   const init = {
     method: input.method,
     headers: input.headers,
     redirect: 'manual',
-    signal: AbortSignal.timeout(input.timeoutMs),
+    signal: AbortSignal.timeout(timeoutMs),
   };
   if (input.body !== undefined && input.method !== 'GET' && input.method !== 'HEAD') {
     init.body = input.body;
@@ -122,9 +132,11 @@ try {
  *
  * Spawning Node costs tens of milliseconds before the helper's own
  * `AbortSignal.timeout` even starts counting, and the reply still has to be
- * parsed. Reserving a slice means a request that runs out of time fails as
- * `net_failed` (what the tool can act on) instead of the sandbox's `time_limit`
- * (which says nothing about the network).
+ * parsed. The margin is subtracted from the **host's** clock, not the helper's,
+ * so the abort instant is fixed before the child starts: a slow start shortens
+ * the request instead of overrunning the deadline. A request that runs out of
+ * time then fails as `net_failed` (what the tool can act on) instead of the
+ * sandbox's `time_limit` (which says nothing about the network).
  */
 const NET_REPORT_MARGIN_MS = 250;
 /** Longest relay detail that may end up in an error message. */
@@ -140,17 +152,20 @@ const MAX_RELAY_DETAIL = 200;
  */
 export function relayFetch(host: RuntimeHost, request: NetRequest): NetRelayResult {
   const budgetMs = Math.max(1, Math.floor(request.remainingMs));
-  const abortMs = Math.max(
-    1,
-    Math.min(SANDBOX_DEFAULT_NET_TIMEOUT_MS, budgetMs - NET_REPORT_MARGIN_MS),
-  );
+  // The instant the helper must give up: on the host's wall clock, before the
+  // deadline, so the reply has time to travel back and the tool sees
+  // `net_failed` rather than the call's `time_limit`. `remainingMs` stays the
+  // input on purpose — a host with an injected clock still gets a sane wall
+  // instant here, because only the duration is taken from that clock.
+  const abortAt = Date.now() + budgetMs - NET_REPORT_MARGIN_MS;
   const payload = JSON.stringify({
     url: request.url,
     method: request.method,
     headers: request.headers,
     body: request.body,
     maxBodyBytes: SANDBOX_MAX_NET_BODY_BYTES,
-    timeoutMs: abortMs,
+    maxTimeoutMs: SANDBOX_DEFAULT_NET_TIMEOUT_MS,
+    abortAt,
   });
 
   const result = host.childProcess.spawnSync(

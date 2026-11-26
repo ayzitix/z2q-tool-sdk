@@ -4,6 +4,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ToolRuntimeError } from '../src/runtime/errors.js';
 import type { ToolRuntimeCode } from '../src/runtime/errors.js';
 import {
+  assertEnvNames,
+  assertFetchHeaders,
+  assertFetchMethod,
+  assertFetchUrl,
   assertGlobPattern,
   assertListable,
   assertProcessArgv,
@@ -12,9 +16,11 @@ import {
   assertWorkspaceDirectory,
   ensurePolicyHost,
   filterGlobResults,
+  hostAllowed,
   isGrantedDirectory,
   isGrantedPath,
 } from '../src/runtime/policy.js';
+import { SANDBOX_MAX_ENV_ENTRIES, SANDBOX_MAX_NET_HEADERS } from '../src/runtime/limits.js';
 import { capabilities, cleanupTempDirs, tempDir } from './runtime-helpers.js';
 
 const ALL_READ = capabilities({ read: ['**/*'], write: ['**/*'], argv: ['node'] });
@@ -80,6 +86,25 @@ describe('path policy', () => {
     for (const input of cases) {
       expectCode(() => assertReadable(input, ALL_READ, workspace), 'path_denied');
     }
+  });
+
+  it('does not deny the .z2q tools root, which is what SECURITY.md warns about', async () => {
+    const workspace = await tempDir('z1-policy-z2q-');
+    await mkdir(join(workspace, '.z2q', 'tools', 'tool.other', '0.1.0'), { recursive: true });
+    await writeFile(
+      join(workspace, '.z2q', 'tools', 'tool.other', '0.1.0', 'approval.json'),
+      '{}',
+      'utf8',
+    );
+    const all = capabilities({ read: ['**/*'] });
+
+    // `.z1` is a denied segment; `.z2q` is not. A tool whose workspace is the
+    // project root and whose grant covers it can therefore read the installed
+    // tools root and the proposals directory — the residual SECURITY.md records
+    // under "Tool Creator", where it says to keep the tools root elsewhere.
+    const installed = '.z2q/tools/tool.other/0.1.0/approval.json';
+    expect(assertReadable(installed, all, workspace)).toBe(installed);
+    expectCode(() => assertReadable('.z1/sessions/a.json', all, workspace), 'path_denied');
   });
 
   it('refuses secret-like file names', async () => {
@@ -305,6 +330,112 @@ describe('NTFS path shapes and real targets', () => {
     // A root listing needs at least one read grant; `docs/**` supplies one.
     const none = capabilities({ read: [] });
     expectCode(() => assertListable('', none, workspace), 'capability_denied');
+  });
+});
+
+describe('net and env policy (rules 11-14)', () => {
+  it('matches hosts exactly, ignores a trailing dot, and matches subdomains only through a wildcard', () => {
+    expect(hostAllowed('api.example.com', ['api.example.com'])).toBe(true);
+    expect(hostAllowed('API.Example.com.', ['api.example.com'])).toBe(true);
+    expect(hostAllowed('api.example.com', ['*.example.com'])).toBe(true);
+    // The wildcard covers the apex as well: an allowance with a hole in it is
+    // worse than either answer.
+    expect(hostAllowed('example.com', ['*.example.com'])).toBe(true);
+    expect(hostAllowed('a.b.example.com', ['*.example.com'])).toBe(true);
+    // A lookalike is not a subdomain.
+    expect(hostAllowed('notexample.com', ['*.example.com'])).toBe(false);
+    expect(hostAllowed('example.com.evil.test', ['*.example.com'])).toBe(false);
+    // `'*'` is any host: the product decision a host makes for full access.
+    expect(hostAllowed('anything.test', ['*'])).toBe(true);
+    // An IP literal is reachable only when it is listed verbatim (or through '*').
+    expect(hostAllowed('127.0.0.1', ['127.0.0.1'])).toBe(true);
+    expect(hostAllowed('127.0.0.1', ['0.0.1'])).toBe(false);
+    expect(hostAllowed('127.0.0.1', ['localhost'])).toBe(false);
+    expect(hostAllowed('', ['*'])).toBe(false);
+  });
+
+  it('accepts http and https only, with no credentials, and checks the host every time', () => {
+    expect(assertFetchUrl('https://api.example.com/v1?q=1', ['api.example.com'], 'net.fetch').hostname).toBe(
+      'api.example.com',
+    );
+    expect(assertFetchUrl('http://127.0.0.1:8080/x', ['*'], 'net.fetch').port).toBe('8080');
+
+    expectCode(() => assertFetchUrl('file:///etc/passwd', ['*'], 'net.fetch'), 'invalid_arguments');
+    expectCode(() => assertFetchUrl('data:text/plain,x', ['*'], 'net.fetch'), 'invalid_arguments');
+    expectCode(() => assertFetchUrl('ftp://example.com/x', ['*'], 'net.fetch'), 'invalid_arguments');
+    expectCode(
+      () => assertFetchUrl('https://user:pass@example.com/', ['example.com'], 'net.fetch'),
+      'invalid_arguments',
+    );
+    expectCode(
+      () => assertFetchUrl('https://example.com/\0', ['example.com'], 'net.fetch'),
+      'invalid_arguments',
+    );
+    expectCode(() => assertFetchUrl('not a url', ['*'], 'net.fetch'), 'invalid_arguments');
+    expectCode(
+      () => assertFetchUrl(`https://example.com/${'a'.repeat(2048)}`, ['example.com'], 'net.fetch'),
+      'invalid_arguments',
+    );
+
+    const denied = expectCode(
+      () => assertFetchUrl('https://api.example.com/', ['other.example.com'], 'net.fetch'),
+      'net_denied',
+    );
+    expect(denied.message).toContain('api.example.com');
+  });
+
+  it('upper-cases seven methods and refuses every other one', () => {
+    expect(assertFetchMethod(undefined)).toBe('GET');
+    expect(assertFetchMethod(null)).toBe('GET');
+    expect(assertFetchMethod(' post ')).toBe('POST');
+    for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']) {
+      expect(assertFetchMethod(method.toLowerCase())).toBe(method);
+    }
+    expectCode(() => assertFetchMethod('TRACE'), 'invalid_arguments');
+    expectCode(() => assertFetchMethod('CONNECT'), 'invalid_arguments');
+    expectCode(() => assertFetchMethod('   '), 'invalid_arguments');
+  });
+
+  it('refuses connection-level headers, CR/LF, NUL and more than the cap', () => {
+    expect(assertFetchHeaders(undefined)).toEqual({});
+    expect(assertFetchHeaders({ 'x-probe': 'yes', 'content-type': 'application/json' })).toEqual({
+      'x-probe': 'yes',
+      'content-type': 'application/json',
+    });
+
+    // A tool must not believe it set a header the broker dropped, so these are
+    // refused rather than ignored.
+    for (const name of ['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'HOST']) {
+      expectCode(() => assertFetchHeaders({ [name]: 'x' }), 'invalid_arguments');
+    }
+    expectCode(() => assertFetchHeaders({ 'x-probe': 'a\r\nx-injected: 1' }), 'invalid_arguments');
+    expectCode(() => assertFetchHeaders({ 'x-probe': 'a\nb' }), 'invalid_arguments');
+    expectCode(() => assertFetchHeaders({ 'x-probe': 'a\0b' }), 'invalid_arguments');
+    expectCode(() => assertFetchHeaders({ 'x-probe': '' }), 'invalid_arguments');
+    expectCode(() => assertFetchHeaders({ 'x-probe': 42 }), 'invalid_arguments');
+    expectCode(() => assertFetchHeaders(['x-probe']), 'invalid_arguments');
+
+    const many: Record<string, string> = {};
+    for (let index = 0; index <= SANDBOX_MAX_NET_HEADERS; index += 1) many[`x-${index}`] = 'v';
+    expectCode(() => assertFetchHeaders(many), 'invalid_arguments');
+  });
+
+  it("draws env.read from exact names only: no '*', no globs, no duplicates, no more than the cap", () => {
+    expect(assertEnvNames(undefined)).toEqual([]);
+    expect(assertEnvNames(['EXA_API_KEY', 'HOME'])).toEqual(['EXA_API_KEY', 'HOME']);
+    // A variable may legitimately be called this; the broker's defineProperty
+    // is what keeps it off the prototype.
+    expect(assertEnvNames(['__proto__'])).toEqual(['__proto__']);
+
+    expectCode(() => assertEnvNames(['*']), 'invalid_arguments');
+    expectCode(() => assertEnvNames(['EXA-API-KEY']), 'invalid_arguments');
+    expectCode(() => assertEnvNames(['EXA_*']), 'invalid_arguments');
+    expectCode(() => assertEnvNames(['1ABC']), 'invalid_arguments');
+    expectCode(() => assertEnvNames(['A', 'A']), 'invalid_arguments');
+    expectCode(() => assertEnvNames('EXA_API_KEY'), 'invalid_arguments');
+
+    const many = Array.from({ length: SANDBOX_MAX_ENV_ENTRIES + 1 }, (_value, index) => `NAME_${index}`);
+    expectCode(() => assertEnvNames(many), 'invalid_arguments');
   });
 });
 

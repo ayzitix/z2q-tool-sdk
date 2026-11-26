@@ -19,7 +19,6 @@ export type ToolCreatorCode =
   | 'capabilities_mismatch'
   | 'invalid_approval'
   | 'not_installed'
-  | 'network_not_supported'
   | 'limit_too_large'
   | 'invalid_fs_grant'
   | 'invalid_argv_grant';

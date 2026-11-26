@@ -192,9 +192,11 @@ JSON instead of stderr. No `curl`, no shell, no new dependency.
    `output_too_large`; a request body over 1 MiB is `invalid_arguments`. The
    bridge's own 1 MiB cap already refuses a larger payload first.
 7. **Time.** One fetch gets `min(SANDBOX_DEFAULT_NET_TIMEOUT_MS, remaining call
-   budget)` and the relay reserves a small slice of that so the helper's own
-   `AbortSignal.timeout` fires first: the tool sees `net_failed`, not the call's
-   `time_limit`. The child is always killed at the call deadline.
+   budget)`. The relay hands the helper an absolute abort instant — the
+   deadline minus a 250 ms reserve — instead of a duration, so a slow Node
+   start-up shortens the request window rather than pushing the abort past the
+   deadline: the tool sees `net_failed`, not the call's `time_limit`. The child
+   is always killed at the call deadline.
 8. **Audit and logs.** A `net.fetch` allow row carries the URL; a denial row
    carries `<redacted>`, so the query string of a refused request — which can
    hold exactly the credential the tool could not send — never lands in a sink.
@@ -212,6 +214,32 @@ JSON instead of stderr. No `curl`, no shell, no new dependency.
 - **No egress control beyond the host name.** A port and a path are the tool's
   choice: `net.hosts: ['api.example.com']` also allows `api.example.com:8443`
   and any path on it. There is no per-path, per-method or per-header policy.
+- **No SSRF defence.** The allow-list is the only check, so a host that lists
+  `'*'` — or `127.0.0.1` — lets a tool reach this machine's own services:
+  loopback ports, `169.254.169.254` and the cloud metadata endpoints, a local
+  admin UI, another tool's dev server. Nothing distinguishes a public host from
+  a private address, and no address class is refused. A manifest that really
+  needs the internet and not the host should name its hosts instead of `'*'`.
+- **The request-body cap is shadowed by the bridge cap.** `SANDBOX_MAX_NET_REQUEST_BYTES`
+  is 1 MiB, the same as `SANDBOX_MAX_BRIDGE_BYTES`, and the body travels inside
+  the JSON payload, so the bridge refuses an oversized body first (measured: a
+  1 MiB + 64 byte body fails as `invalid_arguments` naming the 1 048 576 byte
+  bridge limit, before the broker's own check runs). The effective ceiling is
+  therefore slightly *under* 1 MiB, because the URL, method and headers share
+  the same payload.
+- **Response headers are not counted by this runtime.** Only the body has a
+  policy cap. A response whose header block is large is refused by Node's own
+  HTTP client before the runtime sees it (measured against the helper: ten 1 KiB
+  headers pass, a hundred fail as `net_failed` with `fetch failed`), so an
+  oversized header set cannot reach `ctx.net.fetch` — but the ceiling is undici's
+  default, not a number this SDK sets, and it is not configurable here.
+- **Every fetch starts a Node process.** The relay reserves 250 ms of the
+  budget for that start-up and the reply, measured at roughly 100-115 ms per
+  fetch on a warm Windows machine. A call whose remaining budget is under about
+  250 ms therefore fails as `net_failed` almost immediately — the request may be
+  opened and aborted before it completes, so a server can still see a connection
+  with no request. A host that sets a tight `limits.timeoutMs` chooses that
+  failure mode.
 - **A blocked body is not a blocked response.** The relay reads up to 4 MiB
   before it gives up; `HEAD` and a 204/304 response have no body at all.
 - **The body is UTF-8.** A binary payload comes back lossy, and the lossy string
@@ -333,13 +361,22 @@ each part guarantees and what it does not.
   every creator build avoid a host import. Do not reintroduce one. The sandbox
   still grants whatever the manifest declares; a valid capability is not a
   safety proof.
-- **No provider, network or model.** The SDK never calls a model and has no
-  network client. The host owns the model call and the approval.
+- **No provider and no model in the creator.** `src/creator/*` never calls a
+  model and ships no provider client; the host owns the model call and the
+  approval. The runtime's `ctx.net.fetch` relay (see Network) is the package's
+  only outbound path, and a creator flow never opens it.
 
 The `approval.json` hash covers `dist/index.js`; the capabilities comparison
 covers `dist/tool.json`. Extra files are not copied. `--tools` defaults to
-`./.z1/tools`; `.z1` is a denied segment inside a tool workspace, so choose a
-tools directory outside the tool's workspace when the host must read it.
+`./.z2q/tools`, the same root `createToolCreator` installs into under its
+workspace, and `z1-tool installed` always prints the root it read. That root and
+`<workspace>/.z2q/proposals` are **not** on the sandbox deny list (`.z1` is, and
+`.z2q` is not), so a tool whose workspace is the project root and whose manifest
+grants a broad `fs.read` can read other tools' bundles, their `tool.json`, their
+`approval.json` and the generated proposal sources (measured:
+`tests/runtime-policy.spec.ts` reads an installed `approval.json` through a
+`**/*` grant and is refused `.z1/sessions`). Keep the tools root outside any
+workspace a tool is granted when that matters.
 
 ## Known QuickJS issue: the teardown abort
 
@@ -357,6 +394,7 @@ case per child process:
 | 6 MB `fs.read` in 128 KiB chunks | no |
 | 6 MB `fs.write` (128 KiB chunks, one flush) | no |
 | 6 MB result through the chunked envelope | no |
+| 3 MB `ctx.net.fetch` body, 128 KiB chunks | no |
 | 8 MB argument object | refused: `invalid_arguments` |
 | 8 MB `fs.read`, head and tail slices | no |
 | 6 MB `fs.read`, then a middle `slice()` | **yes** |

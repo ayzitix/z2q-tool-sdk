@@ -278,9 +278,10 @@ a standard MIT text is generated from `package.json`'s author.
 
 `z1-tool-sdk` ships the deterministic half of a tool creator: a prompt, a static
 review, a project scaffold and build, a sandbox smoke test, and an installer
-that records a human approval. **The model call is the host's job.** The SDK has
-no provider, no network access, no model client, and the prompts contain no
-vendor-specific syntax.
+that records a human approval. **The model call is the host's job.** The creator
+has no provider, no model client and no network client of its own; the runtime's
+`ctx.net.fetch` relay (see [Running tools](#running-tools)) is the package's only
+outbound path, and the prompts contain no vendor-specific syntax.
 
 ```
 request
@@ -322,12 +323,13 @@ const smoke = await smokeTestTool(project.dir, { workspace: './my-project', requ
 if (!smoke.ok) throw new Error(JSON.stringify(smoke.runs));
 
 const installed = await installTool({
-  toolsDir: './.z1/tools',
+  // The same default the CLI uses: <workspace>/.z2q/tools.
+  toolsDir: './.z2q/tools',
   dir: project.dir,
   approvedBy: 'me',
   expectCapabilities: project.manifest.capabilities,
 });
-const pkg = await loadInstalledTool('./.z1/tools', installed.name, installed.version);
+const pkg = await loadInstalledTool('./.z2q/tools', installed.name, installed.version);
 ```
 
 `createToolProject` writes `tool.ts`, `package.json`, `tsconfig.json`,
@@ -456,7 +458,7 @@ binary, for a machine where it is on `PATH`.
 `createToolCreator` is the host glue. It builds the prompt, calls **your**
 `generate` callback, extracts the source from a fence, lints it, retries with
 the exact issues (two attempts by default, configurable 1-5), writes the
-project, hashes and smoke-tests the bundle, and returns a proposal. The SDK
+project, hashes and smoke-tests the bundle, and returns a proposal. The creator
 ships no provider, no network client and no model.
 
 ```ts

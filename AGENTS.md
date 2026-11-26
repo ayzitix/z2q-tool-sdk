@@ -73,9 +73,12 @@ external; the rest of `dist/` is plain `tsc` output.
    fields optional in the manifest, matching what `runTool` accepts. Check
    `tests/schema.spec.ts` after any zod bump.
 7. Tests use `node:fs/promises` + `os.tmpdir()` and clean up. No real adb and
-   no outside host: the network specs bind a `node:http` server on `127.0.0.1`
-   with an ephemeral port, assert that a denied host receives **zero** requests,
-   and close every connection in the teardown. Nothing leaves the machine.
+   no outside host: the network specs start a `node:http` server on an ephemeral
+   loopback port **in its own child process** (the relay blocks the host thread,
+   so an in-process server cannot answer while a fetch is in flight), assert
+   that a denied host receives **zero** requests, and kill the server in the
+   teardown. `127.0.0.1` and `localhost` are the only addresses; a name that
+   must not resolve uses `.test`. Nothing leaves the machine.
 8. **Commit and push every change.** The owner's standing instruction: a finished,
    green change is committed and pushed to `main` straight away, under
    `ayzitix <258407778+ayzitix@users.noreply.github.com>`, with no bot trailers and
@@ -100,7 +103,11 @@ external; the rest of `dist/` is plain `tsc` output.
    `__z1_ctx`, `__z1_encode`, `__z1_invoke`, `__z1_run`, `__z1_workspace`,
    `__z1_value`, `console`. Do not add a second bridge, a Node object, or a module
    loader entry: the loader answers for the bundle only and refuses every other
-   request, including every builtin.
+   request, including every builtin. The shim asks for `env.read` **only** when
+   the manifest declares a name (`buildShimSource({ env })` bakes the answer in),
+   so a tool without an `env.read` declaration makes no such crossing and leaves
+   no such audit row; a declared name — including a hand-written `'*'` — still
+   crosses, because the refusal has to reach the tool.
 11. **The deny lists are a list, not a boundary.** They stop the obvious
    (`~/.ssh`, `.git`, `.env`), and realpath containment stops links out of the
    workspace, but a file inside the workspace that matches a grant is readable.

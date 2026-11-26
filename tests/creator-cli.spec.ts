@@ -363,4 +363,27 @@ describe('z1-tool install / installed', () => {
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain('no tools installed in');
   });
+
+  it('defaults --tools to <cwd>/.z2q/tools, the creator root, and prints where it resolved', async () => {
+    const project = join(base, 'hand-installed');
+    await mkdir(project, { recursive: true });
+    const defaultTools = join(project, '.z2q', 'tools');
+
+    const empty = await runCli(['installed'], project);
+    expect(empty.code, empty.stderr).toBe(0);
+    // A hand-installed proposal lands where the creator looks, not in `./.z1/tools`.
+    expect(empty.stdout).toContain(`no tools installed in ${defaultTools}`);
+    expect(empty.stdout).not.toContain('.z1');
+
+    const installed = await runCli(['install', builtDir, '--approved-by', 'me'], project);
+    expect(installed.code, installed.stderr).toBe(0);
+    expect(installed.stdout).toContain(
+      `path: ${join(defaultTools, 'tool.cli-demo', '0.1.0')}`,
+    );
+    expect(await exists(join(defaultTools, 'tool.cli-demo', '0.1.0', 'approval.json'))).toBe(true);
+
+    const listed = await runCli(['installed'], project);
+    expect(listed.code, listed.stderr).toBe(0);
+    expect(listed.stdout).toContain(`tools: ${defaultTools}`);
+  });
 });

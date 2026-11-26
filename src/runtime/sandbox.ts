@@ -10,7 +10,7 @@ import type { Broker } from './broker.js';
 import { ToolRuntimeError, codeFromMessage, detailFromMessage } from './errors.js';
 import type { ToolRuntimeCode } from './errors.js';
 import { SANDBOX_MAX_BRIDGE_BYTES, SANDBOX_MAX_PUMP_ITERATIONS, SANDBOX_STACK_BYTES } from './limits.js';
-import { ENTRY_SOURCE, SHIM_SOURCE } from './shim.js';
+import { ENTRY_SOURCE, buildShimSource } from './shim.js';
 
 /**
  * The QuickJS half of the runtime: one runtime, one context, one `Scope` per
@@ -36,6 +36,14 @@ export interface SandboxInput {
   readonly argsJson: string;
   readonly workspace: string;
   readonly tool: string;
+  /**
+   * True when the manifest declares at least one `env.read` name.
+   *
+   * The shim only calls `env.read` when this is set: with no declared name
+   * `ctx.env` is an empty frozen object, so the call would cross the bridge and
+   * write an audit row for nothing (see `ShimOptions` in `shim.ts`).
+   */
+  readonly envDeclared: boolean;
   readonly memoryBytes: number;
   readonly deadline: number;
   readonly now: () => number;
@@ -102,7 +110,7 @@ function evaluate(
   input: SandboxInput,
 ): Json {
   installBridge(ctx, scope, input);
-  evaluateScript(quickjs, scope, ctx, SHIM_SOURCE, 'z1-shim.js', input);
+  evaluateScript(quickjs, scope, ctx, buildShimSource({ env: input.envDeclared }), 'z1-shim.js', input);
   evaluateScript(quickjs, scope, ctx, ENTRY_SOURCE, 'z1-entry.js', input);
 
   const global = ctx.global;
