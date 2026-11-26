@@ -132,6 +132,7 @@ ctx.signal is a frozen { aborted: false }; the VM cannot observe an abort mid-ca
 ctx.net.fetch(url, { method, headers, body }) -> { ok, status, statusText, url, headers, body, text, json() }
   http(s) only, and only the hosts the manifest declares.
 ctx.env.NAME is a string when the manifest declares env.read ['NAME']; otherwise undefined.
+  The value comes from the workspace .env file first, then from the host environment.
 
 ## Capabilities are declarations
 
@@ -143,6 +144,8 @@ net: { hosts: ['api.example.com'] } - the host allow-list for ctx.net.fetch; '*'
   host, '*.example.com' covers the domain and its subdomains, and [] means no network.
 env: { read: ['EXA_API_KEY'] } - exact environment variable names for ctx.env. No globs,
   no '*': a secret is granted by name or not at all.
+  A key is read from the workspace .env file first, then from the host environment, so the
+  person puts it in .env and the tool just declares the name.
 
 ## Rules
 
@@ -153,6 +156,11 @@ env: { read: ['EXA_API_KEY'] } - exact environment variable names for ctx.env. N
   or WebAssembly. Strings and comments are not identifiers, but do not rely on that:
   use ctx for every host capability.
 - No Node builtins, no global fetch, no timers, no global state. Use ctx for the network
+
+- A credential is read with ctx.env.NAME and its name is declared in env: { read }. If the value
+  is missing, the tool returns a plain result saying which variable is unset; it never looks for a
+  key file. The sandbox cannot read outside the workspace, so a ~/.config or ~/.ssh path is a
+  denial, not a fallback - .env is the file the person already uses.
   and for secrets, and declare every host and name you use.
 - Keep the whole file under 32 KiB.
 - Return JSON-serializable values. Beyond its arguments, the only inputs the tool may read

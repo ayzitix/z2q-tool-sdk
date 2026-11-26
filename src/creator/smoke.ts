@@ -111,7 +111,9 @@ export async function smokeTestTool(
   const runtime = await createToolRuntime({
     workspace: path.resolve(workspace),
     net: { hosts: [...pkg.manifest.capabilities.net.hosts] },
-    env: { inherit: true },
+    // `<workspace>/.env` first: a tool that needs a key should find it in the
+    // one place a person and the tool already agree on, without exporting it.
+    env: { inherit: true, file: '.env' },
   });
   const runs: SmokeTestRun[] = [];
   for (const input of inputs) {

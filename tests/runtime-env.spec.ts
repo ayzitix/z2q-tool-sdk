@@ -174,6 +174,41 @@ describe('ctx.env', () => {
     expect(rows.filter((row) => row.kind === 'log')).toHaveLength(2);
   });
 
+  it('resolves a declared name from the workspace .env, then from the host', async () => {
+    const fixture = await envFixture(
+      `(async () => ({ key: String(ctx.env.EXA_API_KEY), both: String(ctx.env.OTHER) }))()`,
+      ['EXA_API_KEY', 'OTHER'],
+    );
+    const { writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    // The file wins over an inherited value, and `read` wins over the file: the
+    // precedence is read > .env > process.env.
+    await writeFile(
+      join(fixture.workspace, '.env'),
+      ['EXA_API_KEY=from-dotenv', 'OTHER=from-dotenv', ''].join(String.fromCharCode(10)),
+    );
+    const runtime = await createToolRuntime({
+      workspace: fixture.workspace,
+      env: { file: '.env', read: { OTHER: 'from-read' }, inherit: false },
+    });
+
+    const result = await runtime.run(fixture.dir, {});
+    expect(result.value).toEqual({ key: 'from-dotenv', both: 'from-read' });
+  });
+
+  it('treats a missing .env as no values, not a failure', async () => {
+    const fixture = await envFixture(`(async () => ({ key: String(ctx.env.EXA_API_KEY) }))()`, [
+      'EXA_API_KEY',
+    ]);
+    const runtime = await createToolRuntime({
+      workspace: fixture.workspace,
+      env: { file: '.env', inherit: false },
+    });
+
+    const result = await runtime.run(fixture.dir, {});
+    expect(result.value).toEqual({ key: 'undefined' });
+  });
+
   it("refuses a hand-written manifest that asks for every name with '*'", async () => {
     const fixture = await envFixture(`(async () => ({ keys: Object.keys(ctx.env) }))()`, ['*']);
     const runtime = await createToolRuntime({ workspace: fixture.workspace });

@@ -202,6 +202,8 @@ async function runCommand(args: string[]): Promise<number> {
   const { createToolRuntime } = await import('./runtime/index.js');
   const runtime = await createToolRuntime({
     workspace: parsed.workspace,
+    // Declared names come from <workspace>/.env, then this shell's environment.
+    env: { inherit: true, file: '.env' },
     onLog: (level, message) => {
       console.error(`[${level}] ${message}`);
     },

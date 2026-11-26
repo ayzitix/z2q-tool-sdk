@@ -234,7 +234,7 @@ function resolveCapabilities(input: Capabilities | undefined): ManifestCapabilit
       argv: stringList(processCaps.argv, 'capabilities.process.argv'),
     },
     net: {
-      hosts: stringList(net.hosts, 'capabilities.net.hosts'),
+      hosts: hostList(net.hosts),
     },
     env: {
       read: envNameList(env.read, 'capabilities.env.read'),
@@ -265,6 +265,29 @@ function stringList(value: unknown, field: string): string[] {
     return item.trim();
   });
   return [...new Set(items)].sort();
+}
+
+/**
+ * `net.hosts` entries are bare host names.
+ *
+ * A model that has just pasted a URL writes `https://api.exa.ai` or
+ * `api.exa.ai/search`, and the runtime then compares a host against a string it
+ * can never equal: the tool is denied in its smoke test and the reason reads
+ * like a policy decision. Refusing the shape here names what is wrong while the
+ * author can still fix it. `*` and `*.example.com` stay valid.
+ */
+function hostList(value: unknown): string[] {
+  const hosts = stringList(value, 'capabilities.net.hosts');
+  for (const host of hosts) {
+    if (host === '*') continue;
+    if (/^https?:\/\//i.test(host) || host.includes('/') || host.includes(':')) {
+      throw capabilityError(
+        'capabilities.net.hosts',
+        `capabilities.net.hosts entry ${JSON.stringify(host)} must be a bare host name such as api.example.com or *.example.com, never a URL, a path or a port`,
+      );
+    }
+  }
+  return hosts;
 }
 
 /**

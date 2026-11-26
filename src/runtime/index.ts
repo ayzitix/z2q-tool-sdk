@@ -12,6 +12,7 @@ import {
   SANDBOX_MAX_TIMEOUT_MS,
   SANDBOX_MEMORY_BYTES,
 } from './limits.js';
+import { readDotenv } from './dotenv.js';
 import { loadToolPackage } from './package.js';
 import type { ToolPackage } from './package.js';
 import { runInSandbox } from './sandbox.js';
@@ -92,7 +93,19 @@ export interface ToolRuntimeOptions {
    * resolves, whatever is passed here — the manifest is the gate, not this
    * option.
    */
-  env?: false | { read?: Record<string, string>; inherit?: boolean };
+  env?:
+    | false
+    | {
+        read?: Record<string, string>;
+        inherit?: boolean;
+        /**
+         * A dotenv file, relative to the workspace (or absolute). Declared names
+         * resolve from it between `read` and `inherit`, so `<workspace>/.env`
+         * is what a tool means by "my key". Missing or unreadable: no values,
+         * no error.
+         */
+        file?: string;
+      };
   /** Injectable clock, default `Date.now`. */
   now?: () => number;
   /**
@@ -305,7 +318,7 @@ function normalizeOptions(options: ToolRuntimeOptions, host: RuntimeHost): Norma
   }
 
   const net = normalizeNet(options.net);
-  const env = normalizeEnv(options.env);
+  const env = normalizeEnv(options.env, resolvedWorkspace, host);
 
   const processOptions = options.process ?? {};
   const inheritEnv = processOptions.inheritEnv;
@@ -408,24 +421,38 @@ interface EnvSource {
  * and it must not see one that was revoked. `env: false` grants nothing;
  * `env.read` wins over an inherited value.
  */
-function normalizeEnv(value: unknown): EnvSource {
+function normalizeEnv(value: unknown, workspace: string, host: RuntimeHost): EnvSource {
   if (value === undefined) return { enabled: true, values: readProcessEnv() };
   if (value === false) return { enabled: false, values: {} };
   if (typeof value !== 'object' || value === null) {
     throw new ToolRuntimeError(
       'invalid_arguments',
-      'env must be false or an object with read and inherit',
+      'env must be false or an object with read, inherit and file',
     );
   }
-  const record = value as { read?: unknown; inherit?: unknown };
-  assertOnlyKeys(record, ['read', 'inherit'], 'env');
+  const record = value as { read?: unknown; inherit?: unknown; file?: unknown };
+  assertOnlyKeys(record, ['read', 'inherit', 'file'], 'env');
   if (record.inherit !== undefined && typeof record.inherit !== 'boolean') {
     throw new ToolRuntimeError('invalid_arguments', 'env.inherit must be a boolean');
   }
+  if (record.file !== undefined && (typeof record.file !== 'string' || record.file.length === 0)) {
+    throw new ToolRuntimeError('invalid_arguments', 'env.file must be a non-empty string');
+  }
+  // A relative path is a workspace path: the host must not be able to point the
+  // resolver at a file the tool's own grants could not reach.
+  const fileValues =
+    record.file === undefined
+      ? {}
+      : readDotenv((path) => host.fs.readFileSync(path))(
+          host.path.isAbsolute(record.file)
+            ? record.file
+            : host.path.resolve(workspace, record.file),
+        ).values;
   return {
     enabled: true,
     values: {
       ...(record.inherit === false ? {} : readProcessEnv()),
+      ...fileValues,
       ...envReadValues(record.read),
     },
   };
