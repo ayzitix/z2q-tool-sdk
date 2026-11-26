@@ -79,7 +79,8 @@ manifest and decides what to allow; the SDK only normalizes the request.
 | `fs.read` | `[]` | Workspace-relative globs the tool may read. |
 | `fs.write` | `[]` | Workspace-relative globs the tool may write. |
 | `process.argv` | `[]` | Executables the tool may start (`argv[0]`). Never a shell string. |
-| `net.hosts` | `[]` | Host allow-list for `ctx.net.fetch`. |
+| `net.hosts` | `[]` | Host allow-list for `ctx.net.fetch`. `'*'` means any host; `'*.example.com'` covers the domain and its subdomains. |
+| `env.read` | `[]` | Exact environment variable names `ctx.env` carries. No globs, no `'*'`. |
 | `limits.timeoutMs` | `30000` | Call budget, checked between bytecodes: an allocation-bound tool can overrun it by seconds (see [SECURITY.md](./SECURITY.md)). |
 | `limits.maxOutputBytes` | `1048576` | Captured stdout/stderr budget per call. |
 | Runtime | — | `z1-tool-sdk/runtime` enforces every row above inside QuickJS. Anything not granted is denied. |
@@ -99,11 +100,19 @@ A child process gets an OS allow-list, not the host environment: `PATH`,
 full inheritance with `createToolRuntime({ process: { inheritEnv: true } })`, or
 supply `process: { env: { … } }` yourself; a tool's own `env` merges on top.
 
+Secrets are separate from child processes and arrive as `ctx.env`, a frozen
+object that contains **only** the names the manifest declares in `env.read`. A
+declared name resolves from the host `process.env` (snapshotted when the runtime
+is created) unless `createToolRuntime({ env: { read } })` supplies it; `env: {
+inherit: false }` turns the snapshot off and `env: false` grants nothing. An
+undeclared name never resolves, whatever the host passes.
+
 ## Testing
 
 `createTestContext` builds an in-memory `ToolContext`. Capabilities are opt-in:
-`fs` needs `files`, `process` needs `commands`, `net` needs `fetches`. Anything
-else throws a clear error instead of silently succeeding.
+`fs` needs `files`, `process` needs `commands`, `net` needs `fetches`, and
+`ctx.env` holds exactly the names you pass in `env`. Anything else throws a clear
+error instead of silently succeeding.
 
 ```ts
 import { createTestContext, runTool } from 'z1-tool-sdk';
@@ -161,17 +170,16 @@ await runtime.run('./my-tool', {}, { timeoutMs: 5_000 }); // lower this call onl
 with a `ToolRuntimeError` carrying an exact `code` from `ToolRuntimeCode`:
 `invalid_tool`, `invalid_arguments`, `invalid_output`, `capability_denied`,
 `path_outside_workspace`, `path_denied`, `secret_path_denied`,
-`process_argv_denied`, `process_failed`, `process_timeout`, `net_not_supported`,
-`time_limit`, `memory_limit`, `loop_limit`, `output_too_large`, `tool_threw`,
-`audit_limit`.
+`process_argv_denied`, `process_failed`, `process_timeout`, `net_disabled`,
+`net_denied`, `net_failed`, `time_limit`, `memory_limit`, `loop_limit`,
+`output_too_large`, `tool_threw`, `audit_limit`.
 
 The VM gets exactly this: one host function `__z1_invoke(kind, payloadJson)` and
 these globals — `__z1_args`, `__z1_ctx`, `__z1_encode`, `__z1_run`,
 `__z1_workspace`, `__z1_value`, `console` — with a `ToolContext` the shim builds
 on top. The kinds are `fs.read`, `fs.write`, `fs.list`, `fs.glob`, `fs.grep`,
-`process.run`, `log` (and `net.fetch`, which is always refused). `SECURITY.md`
-lists the globals with the test that measures them, so a new one is visible in
-review.
+`process.run`, `net.fetch`, `env.read` and `log`. `SECURITY.md` lists the globals
+with the test that measures them, so a new one is visible in review.
 
 What it gives you:
 
@@ -183,6 +191,13 @@ What it gives you:
   match through the same glob matcher the SDK ships;
 - argv-only child processes, with `argv[0]` grants, a checked `cwd`, refused
   environment overrides, and captured output under a byte cap;
+- HTTP(S) fetches through a blocking relay: http(s) only, no embedded
+  credentials, seven methods, refused `host`/`content-length`/hop-by-hop
+  headers, a host checked on every redirect hop, a body cap, a per-call timeout,
+  and a body returned in bridge-sized chunks;
+- `ctx.env` with exactly the declared names, and `[redacted]` in every log line
+  and refusal message that would otherwise quote a resolved value of 8+
+  characters;
 - per-call memory, stack, time, result-size and job-pump limits, plus an
   interrupt handler that stops `while (true) {}`;
 - audit rows for every allow and every denial, with redacted secret paths;
@@ -190,8 +205,8 @@ What it gives you:
 
 What it does not do (see [SECURITY.md](./SECURITY.md)):
 
-- no network — `ctx.net.fetch` always throws `net_not_supported`, and
-  `net: { hosts }` is refused at creation;
+- no content inspection, TLS pinning or egress filtering: `net.hosts: ['*']`
+  really is any host, and a tool can exfiltrate anything it can read;
 - no `process`, `require`, `fetch`, timers, `Buffer`, or Node builtins; a bundle
   that imports one is refused as `invalid_tool` with the module named;
 - no mid-call abort inside `process.run` (the child is bounded by a timeout), and
@@ -205,6 +220,19 @@ What it does not do (see [SECURITY.md](./SECURITY.md)):
 
 `ctx.signal` is a frozen `{ aborted: false }`: a synchronous VM cannot observe an
 abort mid-call, so the host ends the call instead.
+
+`ctx.net.fetch(url, { method, headers, body })` resolves to `{ ok, status,
+statusText, url, headers, body, text, json() }`. `http` and `https` only, only
+the hosts the manifest declares, at most 5 redirects (each hop checked again),
+7 methods, `host`/`content-length`/`transfer-encoding`/`connection`/`upgrade`
+refused, a 4 MiB response cap and a 15 s default timeout bounded by the call
+budget. `headers` keys are lower-cased, `url` is the final URL after redirects,
+`text` is an alias of `body`, and `json()` closes over the body, so
+`const { json } = response` works. The body is decoded as UTF-8: a binary
+payload comes back lossy.
+
+`ctx.env` is a frozen object holding only the names the manifest declares; an
+ungranted name is `undefined`, and `ctx.env.X = 'y'` throws.
 
 ### `z1-tool run`
 
@@ -250,9 +278,10 @@ a standard MIT text is generated from `package.json`'s author.
 
 `z1-tool-sdk` ships the deterministic half of a tool creator: a prompt, a static
 review, a project scaffold and build, a sandbox smoke test, and an installer
-that records a human approval. **The model call is the host's job.** The SDK has
-no provider, no network access, no model client, and the prompts contain no
-vendor-specific syntax.
+that records a human approval. **The model call is the host's job.** The creator
+has no provider, no model client and no network client of its own; the runtime's
+`ctx.net.fetch` relay (see [Running tools](#running-tools)) is the package's only
+outbound path, and the prompts contain no vendor-specific syntax.
 
 ```
 request
@@ -294,12 +323,13 @@ const smoke = await smokeTestTool(project.dir, { workspace: './my-project', requ
 if (!smoke.ok) throw new Error(JSON.stringify(smoke.runs));
 
 const installed = await installTool({
-  toolsDir: './.z1/tools',
+  // The same default the CLI uses: <workspace>/.z2q/tools.
+  toolsDir: './.z2q/tools',
   dir: project.dir,
   approvedBy: 'me',
   expectCapabilities: project.manifest.capabilities,
 });
-const pkg = await loadInstalledTool('./.z1/tools', installed.name, installed.version);
+const pkg = await loadInstalledTool('./.z2q/tools', installed.name, installed.version);
 ```
 
 `createToolProject` writes `tool.ts`, `package.json`, `tsconfig.json`,
@@ -323,7 +353,7 @@ touches the filesystem. It refuses with one issue per rule:
 | 3 | `forbidden_import` | Any import other than `'z1-tool-sdk'` or `'zod'`, including `node:*`, relative paths, re-exports, `import.meta` and a non-literal `import(x)`. |
 | 4 | `forbidden_identifier` | `process`, `require`, `eval`, `Function`, `globalThis`, `Deno`, `Bun`, `child_process`, `worker_threads`, `net`, `http`, `https`, `dns`, `tls`, `dgram`, `os`, `v8`, `Atomics`, `SharedArrayBuffer`, `WebAssembly` outside strings and comments. |
 | 5 | `missing_capabilities` | No `capabilities` declaration, or one that is not a literal object. |
-| 6 | `network_not_supported` | Any `net` declaration; the runtime has no `net.fetch`. |
+| 6 | `capability_undeclared` | A `ctx.net.fetch` call without `net.hosts`, or a `ctx.env.NAME` read without `NAME` in `env.read`. |
 | 7 | `invalid_argv_grant` | A `process.argv` grant that is a path, a flag, an empty string or not a bare executable name. |
 | 8 | `invalid_fs_grant` | An `fs.read`/`fs.write` grant that is absolute, contains `..`, a backslash, `~`, a drive or a `:` segment. |
 | 9 | `limit_too_large` | `timeoutMs > 60000`, `maxOutputBytes > 8388608`, or a limit that is not a positive literal integer. |
@@ -356,18 +386,19 @@ inside QuickJS, with no host bridge. (When vitest is installed, `z1-tool test`
 runs that project's own vitest suite, which is ordinary host-side test code.)
 Capabilities must be literal objects and the description a literal string,
 because the lint has to decide before anything is written. A computed
-declaration is refused. `net` is refused even with an empty host list, while
-`net: undefined` is treated as absent exactly as `defineTool` treats it. The
-ceilings are 32 KiB of source, `timeoutMs <= 60000`, `maxOutputBytes <= 8388608`
-and a description of at least 20 characters.
+declaration is refused. `net` and `env` declarations are read, not refused: the
+rule that protects them is `capability_undeclared`, which refuses a call the
+declaration does not cover, while `net: undefined` is treated as absent exactly
+as `defineTool` treats it. The ceilings are 32 KiB of source, `timeoutMs <=
+60000`, `maxOutputBytes <= 8388608` and a description of at least 20 characters.
 
 ### Install and approvals
 
 When `tool.ts` exists, `installTool` always rebuilds it before installing; a
 stale `dist/` is never signed. A dist-only directory is refused unless the
 caller passes `expectSha256` or `allowPrebuilt: true`. It recomputes the sha256
-of `dist/index.js` with node's crypto, refuses a net grant, invalid grants or
-oversized limits in the manifest, and copies exactly `dist/tool.json` and
+of `dist/index.js` with node's crypto, refuses invalid grants or oversized
+limits in the manifest, and copies exactly `dist/tool.json` and
 `dist/index.js` into
 `<toolsDir>/<name>/<version>/`. It then re-reads the copied bytes and the copied
 manifest before writing `approval.json`:
@@ -402,9 +433,9 @@ npx z1-tool create ./tools/find-todos --purpose "Find TODO comments." --print-pr
 npx z1-tool create ./tools/find-todos --purpose "Find TODO comments." --source ./generated.ts --write
 npx z1-tool review ./tools/find-todos
 npx z1-tool smoke ./tools/find-todos --args '{"glob":"**/*"}' --workspace ../my-project
-npx z1-tool install ./tools/find-todos --approved-by me
-npx z1-tool install ./prebuilt-tool --expect-sha256 <64 hex chars>
-npx z1-tool installed
+z1 tool install ./tools/find-todos --approved-by me
+z1 tool install ./prebuilt-tool --expect-sha256 <64 hex chars>
+z1 tool installed
 ```
 
 `create` never calls a model. Without `--write` it only prints the prompt. With
@@ -417,14 +448,17 @@ denial count and `smoke: n/m ok`; a caught denial makes the run fail unless
 `allowDenials` is set in the API. `install` always rebuilds `tool.ts` when it
 exists and prints the capability summary and the install path; a dist-only
 directory needs `--expect-sha256` or `--allow-prebuilt`. `installed` lists
-versions. `--tools` defaults to `./.z1/tools`.
+versions and always prints the tools root it read. `--tools` defaults to
+`./.z2q/tools`, the same root `createToolCreator` installs into under its
+workspace; `z1-tool install` is the same command through this package's own
+binary, for a machine where it is on `PATH`.
 
 ### Connecting a model
 
 `createToolCreator` is the host glue. It builds the prompt, calls **your**
 `generate` callback, extracts the source from a fence, lints it, retries with
 the exact issues (two attempts by default, configurable 1-5), writes the
-project, hashes and smoke-tests the bundle, and returns a proposal. The SDK
+project, hashes and smoke-tests the bundle, and returns a proposal. The creator
 ships no provider, no network client and no model.
 
 ```ts
@@ -473,6 +507,7 @@ during that step is reported when it returns.
     "fs": { "read": ["**/*"], "write": [] },
     "process": { "argv": [] },
     "net": { "hosts": [] },
+    "env": { "read": [] },
     "limits": { "timeoutMs": 10000, "maxOutputBytes": 1048576 }
   }
 }
@@ -515,13 +550,16 @@ z1-tool create <dir> --purpose <text> [--name tool.x] [--examples <json>]
                 [--print-prompt] [--write] [--source <file>]   request + prompt / skeleton
 z1-tool review <dir|file> [--json]                          static review (then a temp build)
 z1-tool smoke <dir> [--args <json>] [--workspace <dir>]     build and run samples
-z1-tool install <dir> [--tools <dir>] [--approved-by <name>] install behind approval.json
+z1 tool install <dir> [--tools <dir>] [--approved-by <name>] install behind approval.json
                             [--expect-sha256 <hex>] [--allow-prebuilt]
-z1-tool installed [--tools <dir>]                           list installed versions
+z1 tool installed [--tools <dir>]                           list installed versions
 z1-tool --help
 ```
 
-Every command prints one line on success and exits non-zero on failure.
+Every command prints one line on success and exits non-zero on failure. The
+console runs this CLI as `z1 tool <command>`; `z1-tool` is the package's own
+binary (`bin` in `package.json`), for a machine where it is installed and on
+`PATH`.
 
 ## License
 

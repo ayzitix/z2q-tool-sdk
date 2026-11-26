@@ -183,6 +183,9 @@ const FIND_TODOS_MANIFEST = `{
     "net": {
       "hosts": []
     },
+    "env": {
+      "read": []
+    },
     "limits": {
       "timeoutMs": 10000,
       "maxOutputBytes": 262144

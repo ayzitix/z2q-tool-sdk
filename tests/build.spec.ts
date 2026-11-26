@@ -43,6 +43,9 @@ describe('buildTool', () => {
       timeoutMs: 10_000,
       maxOutputBytes: 262_144,
     });
+    // A tool that declares neither gets the empty defaults, in the manifest too.
+    expect(result.manifest.capabilities.net).toEqual({ hosts: [] });
+    expect(result.manifest.capabilities.env).toEqual({ read: [] });
 
     const onDisk = JSON.parse(await readFile(result.manifestPath, 'utf8')) as ToolManifest;
     expect(onDisk).toEqual(result.manifest);
@@ -103,6 +106,44 @@ export const tool = defineTool({
     await runTool(module.tool as AnyToolDefinition, {}, createTestContext());
     expect((globalThis as Record<string, unknown>).__z1ToolSdkRunMarker).toBe(true);
     delete (globalThis as Record<string, unknown>).__z1ToolSdkRunMarker;
+  });
+
+  it('normalises net and env declarations and writes them to tool.json', async () => {
+    const dir = await tempDir('z1-build-net-');
+    const sdkSpec = relativeSpecifier(dir, join(repoRoot, 'src', 'index.ts'));
+    const zodSpec = relativeSpecifier(dir, join(repoRoot, 'node_modules', 'zod', 'index.js'));
+    const entry = join(dir, 'tool.ts');
+    await writeFile(
+      entry,
+      `import { defineTool } from '${sdkSpec}';
+import { z } from '${zodSpec}';
+
+export const tool = defineTool({
+  name: 'tool.net-declared',
+  version: '0.1.0',
+  description: 'Declares network access and an env allow-list.',
+  parameters: z.object({}),
+  capabilities: {
+    net: { hosts: ['b.example.com', '*', 'a.example.com'] },
+    env: { read: ['EXA_API_KEY', 'HOME', 'EXA_API_KEY'] },
+  },
+  run: async () => ({ ok: true }),
+});
+`,
+      'utf8',
+    );
+
+    const result = await buildTool({ entry, outDir: join(dir, 'dist') });
+    // Sorted and de-duplicated like every other capability list. `'*'` sorts
+    // first, so a manifest that allows any host is visible at the top.
+    expect(result.manifest.capabilities.net).toEqual({
+      hosts: ['*', 'a.example.com', 'b.example.com'],
+    });
+    expect(result.manifest.capabilities.env).toEqual({ read: ['EXA_API_KEY', 'HOME'] });
+
+    const onDisk = JSON.parse(await readFile(result.manifestPath, 'utf8')) as ToolManifest;
+    expect(onDisk.capabilities.net).toEqual({ hosts: ['*', 'a.example.com', 'b.example.com'] });
+    expect(onDisk.capabilities.env).toEqual({ read: ['EXA_API_KEY', 'HOME'] });
   });
 
   it('keeps node:fs, node:child_process and node:net out of the library entry graph', async () => {

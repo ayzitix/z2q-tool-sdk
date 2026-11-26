@@ -7,8 +7,10 @@ import { SANDBOX_MAX_BRIDGE_BYTES, SANDBOX_MAX_READ_BYTES } from './limits.js';
  * Three scripts are evaluated once per call, after the host function and globals
  * are installed:
  *
- * - {@link SHIM_SOURCE} builds `globalThis.__z1_ctx`, a `ToolContext` over
- *   `__z1_invoke`, and maps `console.*` onto `log`.
+ * - {@link buildShimSource} builds `globalThis.__z1_ctx`, a `ToolContext` over
+ *   `__z1_invoke`, and maps `console.*` onto `log`. It is a function, not a
+ *   constant, because one thing about the call has to be baked into the source:
+ *   whether the manifest declares any `env.read` name (see {@link ShimOptions}).
  * - {@link ENTRY_SOURCE} builds `globalThis.__z1_run`, the async entry point the
  *   host calls with the arguments as a JSON string, and `globalThis.__z1_encode`.
  * - The host then calls `__z1_encode(offset, length)` repeatedly, after the entry
@@ -22,12 +24,31 @@ import { SANDBOX_MAX_BRIDGE_BYTES, SANDBOX_MAX_READ_BYTES } from './limits.js';
  * other side, so no single crossing goes near the trigger.
  */
 
+/** What the shim has to know about this call before the VM starts. */
+export interface ShimOptions {
+  /**
+   * True when the manifest declares at least one `env.read` name.
+   *
+   * With no declared name `ctx.env` can only ever be `{}`, so the shim builds
+   * that empty frozen object without a bridge call: one crossing and one audit
+   * row fewer per call, and nothing a tool could learn from the round trip. A
+   * declaration is what pays for the call — including a hand-written `tool.json`
+   * asking for `'*'`, which must still reach `assertEnvNames` and be refused,
+   * rather than silently look like a grant that resolved to nothing.
+   */
+  readonly env: boolean;
+}
+
 /** Builds `globalThis.__z1_ctx`, a `ToolContext` over `__z1_invoke`. */
-export const SHIM_SOURCE = String.raw`(function () {
+export function buildShimSource(options: ShimOptions): string {
+  return String.raw`(function () {
   'use strict';
 
   var BRIDGE_LIMIT = ${SANDBOX_MAX_BRIDGE_BYTES};
   var READ_LIMIT = ${SANDBOX_MAX_READ_BYTES};
+  // Baked in, not fetched: a manifest that declares no name needs no crossing,
+  // and the VM has no other way to learn what the manifest said.
+  var ENV_DECLARED = ${options.env ? 'true' : 'false'};
   // 128 KiB per read chunk. 1 MiB pieces of text outside Latin-1 still abort at
   // dispose; measured clean at 128 KiB for the same content, and ASCII is clean
   // at 1 MiB, so the smaller request buys the 16-bit path for a few crossings.
@@ -176,6 +197,116 @@ export const SHIM_SOURCE = String.raw`(function () {
     throw new Error('tool_threw: fs.write did not finish');
   }
 
+  /**
+   * Pull a response body, one bridge call per chunk.
+   *
+   * The host keeps the body between the calls and answers { data, next }; next
+   * is the code-unit offset to continue from, or null at the end. Appended with
+   * += and never joined, exactly like readFile and for the same measured reason
+   * (SECURITY.md): a multi-megabyte string built any other way makes the
+   * QuickJS teardown abort.
+   */
+  function readNetBody(head) {
+    var text = typeof head.data === 'string' ? head.data : '';
+    var next = head.next;
+    for (var chunk = 0; chunk < 4096; chunk += 1) {
+      if (next === null || next === undefined) return text;
+      if (typeof next !== 'number' || next <= 0) {
+        throw new Error('tool_threw: the sandbox returned a bad net.fetch offset');
+      }
+      var reply = call('net.fetch', { offset: next });
+      if (reply === null || typeof reply !== 'object' || typeof reply.data !== 'string') {
+        throw new Error('tool_threw: the sandbox returned a malformed net.fetch chunk');
+      }
+      text += reply.data;
+      if (typeof reply.next !== 'number') return text;
+      if (reply.next <= next) {
+        throw new Error('tool_threw: the sandbox returned a non-advancing net.fetch offset');
+      }
+      next = reply.next;
+    }
+    throw new Error('tool_threw: net.fetch did not finish');
+  }
+
+  /**
+   * ctx.net.fetch. Nothing is validated here: the host owns the scheme, the
+   * host allow-list, the method, the headers and the body cap, and a second
+   * opinion in the VM could only disagree with the boundary.
+   */
+  function netFetch(url, init) {
+    var options = init === undefined || init === null ? {} : init;
+    var value = call('net.fetch', {
+      url: url,
+      method: options.method,
+      headers: options.headers,
+      body: options.body
+    });
+    if (value === null || typeof value !== 'object') {
+      throw new Error('tool_threw: the sandbox returned a malformed net.fetch reply');
+    }
+    var body = readNetBody(value);
+    return {
+      ok: value.ok,
+      status: value.status,
+      statusText: value.statusText,
+      url: value.url,
+      headers: value.headers,
+      body: body,
+      text: body,
+      // Closes over body, never this: a destructured call must work, and the
+      // body is already assembled by the time this returns.
+      json: function () {
+        try {
+          return JSON.parse(body);
+        } catch (error) {
+          var detail = error && error.message ? String(error.message) : String(error);
+          throw new Error('tool_threw: the response body is not valid JSON (' + detail + ')');
+        }
+      }
+    };
+  }
+
+  /**
+   * ctx.env: exactly the names the manifest declares, in one call.
+   *
+   * An undeclared name is simply absent, so ctx.env.X is undefined without a
+   * second crossing. A manifest that declares no name at all is answered here,
+   * without a call: there is nothing to ask for, and an env.read row for a
+   * grant nobody made is noise in the audit trail.
+   *
+   * A refusal (a hand-written tool.json asking for "*") fails the call instead
+   * of silently granting nothing: a declaration the runtime could not read must
+   * not look like one it honoured.
+   */
+  function readEnv() {
+    var values = {};
+    if (!ENV_DECLARED) return Object.freeze(values);
+    var reply = call('env.read', {});
+    if (
+      reply === null ||
+      typeof reply !== 'object' ||
+      reply.values === null ||
+      typeof reply.values !== 'object'
+    ) {
+      return Object.freeze(values);
+    }
+    var names = Object.keys(reply.values);
+    for (var index = 0; index < names.length; index += 1) {
+      var name = names[index];
+      if (typeof reply.values[name] !== 'string') continue;
+      // defineProperty, not assignment: an environment variable is allowed to
+      // be called "__proto__", and assigning that name would reach the
+      // prototype instead of creating an entry.
+      Object.defineProperty(values, name, {
+        value: reply.values[name],
+        enumerable: true,
+        writable: false,
+        configurable: false
+      });
+    }
+    return Object.freeze(values);
+  }
+
   globalThis.__z1_ctx = {
     workspace: globalThis.__z1_workspace,
     signal: Object.freeze({ aborted: false }),
@@ -207,9 +338,10 @@ export const SHIM_SOURCE = String.raw`(function () {
     },
     net: {
       fetch: async function (url, init) {
-        return call('net.fetch', { url: url, init: init });
+        return netFetch(url, init);
       }
     },
+    env: readEnv(),
     log: function (level, message) {
       call('log', { level: level, message: message });
     }
@@ -224,6 +356,7 @@ export const SHIM_SOURCE = String.raw`(function () {
   };
 })();
 `;
+}
 
 /**
  * Builds `globalThis.__z1_run` (import, validate, call, stash) and

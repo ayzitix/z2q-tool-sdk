@@ -11,7 +11,7 @@ QuickJS sandbox.
 ```sh
 npm install
 npm run build       # tsc -> dist, then esbuild bundles src/cli.ts -> dist/cli.js
-npm test            # vitest, real temp dirs, no network
+npm test            # vitest, real temp dirs, loopback HTTP servers only
 npm run typecheck   # tsc --noEmit over src, tests and examples
 ```
 
@@ -40,11 +40,12 @@ external; the rest of `dist/` is plain `tsc` output.
 - `src/runtime/index.ts` — `z1-tool-sdk/runtime`: `createToolRuntime`, `ToolRuntime.run`, options, sinks.
 - `src/runtime/definition.ts` — the sandboxed manifest read used by `buildTool`; one module, no bridge, one 1 MiB cap.
 - `src/runtime/sandbox.ts` — the QuickJS half: one runtime per call, one `Scope`, every handle.
-- `src/runtime/policy.ts` — the pure capability policy (paths, globs, argv, env, realpath).
-- `src/runtime/broker.ts` — the only code that reads files or spawns processes.
+- `src/runtime/policy.ts` — the pure capability policy (paths, globs, argv, realpath, fetch URLs and headers, env names).
+- `src/runtime/fetch.ts` — the blocking network relay: `NET_HELPER_SOURCE` and the `spawnSync` that runs it.
+- `src/runtime/broker.ts` — the only code that reads files, spawns processes or opens a connection.
 - `src/runtime/audit.ts` — `AuditRow`, sinks, the per-call collector and the row cap.
 - `src/runtime/limits.ts` — the limits table as constants.
-- `src/runtime/errors.ts` — `ToolRuntimeError` and the 17 codes.
+- `src/runtime/errors.ts` — `ToolRuntimeError` and the 19 codes.
 - `src/runtime/package.ts` — `loadToolPackage`: `dist/tool.json` + `dist/index.js`.
 - `src/runtime/shim.ts` — the VM-side source strings; no host imports may appear inside.
 - `src/runtime/host.ts` — lazy `node:` modules behind structural types.
@@ -71,8 +72,13 @@ external; the rest of `dist/` is plain `tsc` output.
    converter dependency or switch to output mode: input mode keeps defaulted
    fields optional in the manifest, matching what `runTool` accepts. Check
    `tests/schema.spec.ts` after any zod bump.
-7. Tests use `node:fs/promises` + `os.tmpdir()` and clean up. No network, no
-   real adb, no real fetches.
+7. Tests use `node:fs/promises` + `os.tmpdir()` and clean up. No real adb and
+   no outside host: the network specs start a `node:http` server on an ephemeral
+   loopback port **in its own child process** (the relay blocks the host thread,
+   so an in-process server cannot answer while a fetch is in flight), assert
+   that a denied host receives **zero** requests, and kill the server in the
+   teardown. `127.0.0.1` and `localhost` are the only addresses; a name that
+   must not resolve uses `.test`. Nothing leaves the machine.
 8. **Commit and push every change.** The owner's standing instruction: a finished,
    green change is committed and pushed to `main` straight away, under
    `ayzitix <258407778+ayzitix@users.noreply.github.com>`, with no bot trailers and
@@ -97,7 +103,11 @@ external; the rest of `dist/` is plain `tsc` output.
    `__z1_ctx`, `__z1_encode`, `__z1_invoke`, `__z1_run`, `__z1_workspace`,
    `__z1_value`, `console`. Do not add a second bridge, a Node object, or a module
    loader entry: the loader answers for the bundle only and refuses every other
-   request, including every builtin.
+   request, including every builtin. The shim asks for `env.read` **only** when
+   the manifest declares a name (`buildShimSource({ env })` bakes the answer in),
+   so a tool without an `env.read` declaration makes no such crossing and leaves
+   no such audit row; a declared name — including a hand-written `'*'` — still
+   crosses, because the refusal has to reach the tool.
 11. **The deny lists are a list, not a boundary.** They stop the obvious
    (`~/.ssh`, `.git`, `.env`), and realpath containment stops links out of the
    workspace, but a file inside the workspace that matches a grant is readable.
@@ -144,9 +154,11 @@ external; the rest of `dist/` is plain `tsc` output.
     sha256 and the resolved capabilities, and `loadInstalledTool` rechecks both.
     The hash covers `dist/index.js`; the capabilities comparison covers
     `dist/tool.json`.
-16. **The creator has no provider, no network and no model.** The model call is
-    the host's. Do not add an SDK client, a key, a `fetch`, or provider-specific
-    text to `src/creator/*`; the prompts are plain deterministic text.
+16. **The creator has no provider, no network client and no model.** The model
+    call is the host's. Do not add an SDK client, a key, a `fetch`, or
+    provider-specific text to `src/creator/*`; the prompts are plain
+    deterministic text. (The *runtime* relays `ctx.net.fetch`; the creator only
+    reads and describes the declaration, and the smoke test passes it through.)
 17. **`flow.ts` stays model-agnostic and never installs implicitly.**
     `createToolCreator` calls only the injected `generate`; it must not import a
     provider, open a network connection or read a key. `propose()` writes only

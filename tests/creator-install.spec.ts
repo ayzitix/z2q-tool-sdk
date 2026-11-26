@@ -347,14 +347,20 @@ describe('describeCapabilities', () => {
     networkManifest.capabilities.net.hosts = ['api.example.com'];
     const network = describeCapabilities(networkManifest);
     expect(network.risk).toBe('network');
-    expect(network.lines[0]).toContain('Requests network hosts');
-    expect(network.lines[0]).toContain('net.fetch');
+    expect(network.lines[0]).toContain('net hosts: "api.example.com"');
+    expect(network.lines[0]).toContain('ctx.net.fetch');
+
+    const secrets = rawManifest();
+    secrets.capabilities.env.read = ['EXA_API_KEY'];
+    const env = describeCapabilities(secrets);
+    expect(env.risk).toBe('read-only');
+    expect(env.lines[0]).toContain('env read: "EXA_API_KEY"');
   });
 
   it('describes a tool with no grants and keeps quoted values on one line', () => {
     const empty = describeCapabilities(rawManifest());
     expect(empty.risk).toBe('read-only');
-    expect(empty.lines[0]).toContain('No filesystem, process or network grants');
+    expect(empty.lines[0]).toContain('No filesystem, process, network or environment grants');
     expect(empty.lines).toHaveLength(3);
 
     const injected = rawManifest();

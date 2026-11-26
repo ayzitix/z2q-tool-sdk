@@ -35,12 +35,13 @@ export function describeCapabilities(manifest: ToolManifest): CapabilitySummary 
     );
   }
   if (capabilities.net.hosts.length > 0) {
-    lines.push(
-      `Requests network hosts ${quoted(capabilities.net.hosts)}; the runtime does not support net.fetch today.`,
-    );
+    lines.push(`Requests network access to net hosts: ${quoted(capabilities.net.hosts)} through ctx.net.fetch.`);
+  }
+  if (capabilities.env.read.length > 0) {
+    lines.push(`Reads the environment variables env read: ${quoted(capabilities.env.read)}.`);
   }
   if (lines.length === 0) {
-    lines.push('No filesystem, process or network grants.');
+    lines.push('No filesystem, process, network or environment grants.');
   }
 
   lines.push(`Stops a call after ${capabilities.limits.timeoutMs} ms.`);

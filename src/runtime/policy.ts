@@ -2,6 +2,10 @@ import { globToRegExp, normalizeGlobPattern } from '../context.js';
 import type { ManifestCapabilities } from '../types.js';
 import { ToolRuntimeError } from './errors.js';
 import { hostNow, runtimeHost } from './host.js';
+import {
+  SANDBOX_MAX_ENV_ENTRIES,
+  SANDBOX_MAX_NET_HEADERS,
+} from './limits.js';
 
 /**
  * The capability policy: pure, synchronous decisions about one workspace path,
@@ -292,6 +296,217 @@ export function assertWorkspaceDirectory(input: string, workspace: string): stri
     throw refusal('invalid_arguments', 'process.run cwd must be a directory');
   }
   return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Rules 11-13: the network, and rule 14: the environment
+//
+// These are the pure half of `ctx.net.fetch` and `ctx.env`: no socket, no
+// `process.env`, no QuickJS. `broker.ts` decides with them and performs with
+// the host modules, exactly like the filesystem rules above.
+// ---------------------------------------------------------------------------
+
+/** The seven methods the relay speaks; everything else is refused by name. */
+const FETCH_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+
+/**
+ * Headers a tool may never set: they describe the connection the broker opens,
+ * not the request the tool makes. A forged `host` reaches another virtual host
+ * on the same address, `content-length` and `transfer-encoding` desynchronize
+ * the body, and `connection`/`upgrade` would ask for a protocol switch.
+ */
+const DENIED_HEADERS = new Set([
+  'host',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'upgrade',
+]);
+
+const MAX_URL_LENGTH = 2048;
+const MAX_HEADER_NAME_LENGTH = 128;
+const MAX_HEADER_VALUE_LENGTH = 4096;
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * True when `host` is covered by `allow`.
+ *
+ * Matching is case-insensitive and a trailing dot (the DNS root) is ignored, so
+ * `API.Example.com.` matches `api.example.com`. `'*'` covers everything, which
+ * is what a host that asked for full network access declares. `'*.example.com'`
+ * covers `example.com` itself **and** every subdomain: a tool allowed the whole
+ * wildcard has no reason to be refused the apex, and refusing it would only
+ * produce a confusing half-allowance. Everything else is an exact match, so an
+ * IP literal is reachable only when it is listed verbatim (or through `'*'`),
+ * never through a wildcard and never through a lookalike name.
+ */
+export function hostAllowed(host: string, allow: readonly string[]): boolean {
+  const target = normalizeHost(host);
+  if (target.length === 0) return false;
+  for (const entry of allow) {
+    if (typeof entry !== 'string') continue;
+    const pattern = normalizeHost(entry);
+    if (pattern === '*') return true;
+    if (pattern.startsWith('*.')) {
+      // `*.example.com` -> suffix `.example.com`, apex `example.com`.
+      if (target === pattern.slice(2) || target.endsWith(pattern.slice(1))) return true;
+      continue;
+    }
+    if (pattern === target) return true;
+  }
+  return false;
+}
+
+/**
+ * Validate one `net.fetch` URL against one allow-list and return it parsed.
+ *
+ * The check runs **per hop**, on the URL that is about to be requested, which
+ * is why the broker calls it again for every redirect: a redirect is a request
+ * to a host the tool never named. Anything that is not plain `http:`/`https:`
+ * is refused before a socket exists — `file:`, `data:` and `ftp:` would reach a
+ * different subsystem of the host. A URL carrying `user:pass@` is refused as
+ * well: those credentials would either travel as an `Authorization` header the
+ * audit cannot see, or be dropped silently, and both are surprises.
+ */
+export function assertFetchUrl(url: unknown, hosts: readonly string[], label: string): URL {
+  if (typeof url !== 'string' || url.length === 0) {
+    throw refusal('invalid_arguments', `${label} requires a URL string`);
+  }
+  if (url.length > MAX_URL_LENGTH) {
+    throw refusal('invalid_arguments', `${label} URLs are limited to ${MAX_URL_LENGTH} characters`);
+  }
+  if (url.includes('\0')) {
+    throw refusal('invalid_arguments', `${label} URLs must not contain NUL bytes`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw refusal('invalid_arguments', `${label} requires an absolute http(s) URL`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw refusal(
+      'invalid_arguments',
+      `${label} only speaks http and https, not "${parsed.protocol.replace(':', '')}"`,
+    );
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw refusal('invalid_arguments', `${label} URLs must not embed credentials`);
+  }
+  const host = normalizeHost(parsed.hostname);
+  if (host.length === 0) {
+    throw refusal('invalid_arguments', `${label} requires a host`);
+  }
+  if (!hostAllowed(host, hosts)) {
+    throw refusal('net_denied', `${label} is not allowed to reach "${host}"`);
+  }
+  return parsed;
+}
+
+/** Upper-case one method, defaulting to GET, and refuse anything unusual. */
+export function assertFetchMethod(method: unknown): string {
+  if (method === undefined || method === null) return 'GET';
+  if (typeof method !== 'string' || method.trim().length === 0) {
+    throw refusal('invalid_arguments', 'net.fetch method must be a non-empty string');
+  }
+  const upper = method.trim().toUpperCase();
+  if (!FETCH_METHODS.has(upper)) {
+    throw refusal(
+      'invalid_arguments',
+      `net.fetch method "${upper}" is not allowed (${[...FETCH_METHODS].join(', ')})`,
+    );
+  }
+  return upper;
+}
+
+/**
+ * Validate and copy the request headers.
+ *
+ * Every name and value must be a non-empty string with no CR, LF or NUL, so a
+ * value cannot split the header block; the count is capped. The names in
+ * {@link DENIED_HEADERS} are refused rather than dropped, because silently
+ * ignoring one would make a tool believe it sent something it did not.
+ */
+export function assertFetchHeaders(headers: unknown): Record<string, string> {
+  if (headers === undefined || headers === null) return {};
+  if (typeof headers !== 'object' || Array.isArray(headers)) {
+    throw refusal('invalid_arguments', 'net.fetch headers must be an object of strings');
+  }
+  const entries = Object.entries(headers as Record<string, unknown>);
+  if (entries.length > SANDBOX_MAX_NET_HEADERS) {
+    throw refusal(
+      'invalid_arguments',
+      `net.fetch headers are limited to ${SANDBOX_MAX_NET_HEADERS} entries`,
+    );
+  }
+  const out: Record<string, string> = {};
+  for (const [name, value] of entries) {
+    if (name.length === 0 || name.length > MAX_HEADER_NAME_LENGTH) {
+      throw refusal(
+        'invalid_arguments',
+        `net.fetch header names are 1-${MAX_HEADER_NAME_LENGTH} characters`,
+      );
+    }
+    if (typeof value !== 'string' || value.length === 0) {
+      throw refusal('invalid_arguments', `net.fetch header "${name}" must be a non-empty string`);
+    }
+    if (value.length > MAX_HEADER_VALUE_LENGTH) {
+      throw refusal(
+        'invalid_arguments',
+        `net.fetch header "${name}" is longer than ${MAX_HEADER_VALUE_LENGTH} characters`,
+      );
+    }
+    if (/[\r\n]/.test(name) || name.includes('\0') || /[\r\n]/.test(value) || value.includes('\0')) {
+      throw refusal(
+        'invalid_arguments',
+        `net.fetch header "${name}" must not contain CR, LF or NUL`,
+      );
+    }
+    if (DENIED_HEADERS.has(name.toLowerCase())) {
+      throw refusal('invalid_arguments', `net.fetch may not set the "${name}" header`);
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * Validate a declared `env.read` list.
+ *
+ * Names are exact and bounded: no globs, no `'*'`, no duplicates. This runs on
+ * the manifest before anything is resolved, so a hand-written `tool.json`
+ * cannot ask for every secret the host holds with one wildcard. It is exported
+ * because `defineTool` enforces the same shape at the authoring boundary.
+ */
+export function assertEnvNames(read: unknown): string[] {
+  if (read === undefined || read === null) return [];
+  if (!Array.isArray(read)) {
+    throw refusal('invalid_arguments', 'env.read must be an array of environment variable names');
+  }
+  if (read.length > SANDBOX_MAX_ENV_ENTRIES) {
+    throw refusal('invalid_arguments', `env.read is limited to ${SANDBOX_MAX_ENV_ENTRIES} names`);
+  }
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, name] of read.entries()) {
+    if (typeof name !== 'string' || !ENV_NAME_PATTERN.test(name)) {
+      throw refusal(
+        'invalid_arguments',
+        `env.read[${index}] must be an environment variable name matching ${ENV_NAME_PATTERN.source}`,
+      );
+    }
+    if (seen.has(name)) {
+      throw refusal('invalid_arguments', `env.read names "${name}" twice`);
+    }
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+function normalizeHost(host: string): string {
+  const trimmed = host.trim().toLowerCase();
+  return trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
 }
 
 /** Rule 10: argv shape before any grant is considered. */
@@ -606,7 +821,10 @@ function refusal(
     | 'path_denied'
     | 'secret_path_denied'
     | 'capability_denied'
-    | 'process_argv_denied',
+    | 'process_argv_denied'
+    | 'net_disabled'
+    | 'net_denied'
+    | 'net_failed',
   message: string,
 ): ToolRuntimeError {
   return new ToolRuntimeError(code, message);

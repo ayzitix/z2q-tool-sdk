@@ -8,14 +8,22 @@ import type {
 } from '../types.js';
 import type { AuditCollector } from './audit.js';
 import { ToolRuntimeError } from './errors.js';
+import { relayFetch } from './fetch.js';
+import type { NetRelayResult } from './fetch.js';
 import type { HostExecError, RuntimeHost } from './host.js';
 import {
   SANDBOX_MAX_BRIDGE_BYTES,
   SANDBOX_MAX_GLOB_RESULTS,
   SANDBOX_MAX_GREP_MATCHES,
+  SANDBOX_MAX_NET_REDIRECTS,
+  SANDBOX_MAX_NET_REQUEST_BYTES,
   SANDBOX_MAX_READ_BYTES,
 } from './limits.js';
 import {
+  assertEnvNames,
+  assertFetchHeaders,
+  assertFetchMethod,
+  assertFetchUrl,
   assertGlobPattern,
   assertListable,
   assertProcessArgv,
@@ -23,6 +31,7 @@ import {
   assertWritable,
   assertWorkspaceDirectory,
   filterGlobResults,
+  hostAllowed,
   isDeniedFileName,
   isDeniedRealPath,
   isDeniedSegmentName,
@@ -39,12 +48,36 @@ const MAX_ENV_ENTRIES = 256;
 const MAX_PENDING_WRITES = 16;
 /** `fs.grep` options the bridge understands; anything else is refused (n3). */
 const GREP_OPTION_KEYS: readonly string[] = ['glob', 'ignoreCase'];
+/** Body bytes requested per `net.fetch` chunk: the same 1/8 bridge slice `fs.read` uses. */
+const NET_CHUNK_BYTES = SANDBOX_MAX_BRIDGE_BYTES / 8;
+/** Secrets shorter than this are not masked: a two-letter value would eat the log. */
+const MIN_SECRET_LENGTH = 8;
+/** Longest `env.read` audit target; a longer list is summarized as a count. */
+const MAX_ENV_AUDIT_TARGET = 512;
+const REDIRECT_STATUSES: readonly number[] = [301, 302, 303, 307, 308];
 
 export interface BrokerProcessOptions {
   /** Base environment for children. */
   readonly env: Record<string, string>;
   readonly timeoutMs: number | undefined;
   readonly maxOutputBytes: number;
+}
+
+/**
+ * The host's network ceiling, as `createToolRuntime({ net })` resolved it.
+ *
+ * `enabled: false` is `net: false`: every `net.fetch` fails with `net_disabled`
+ * whatever the manifest declares. `hosts` is the optional extra list: a URL host
+ * must be covered by the manifest **and** by this one.
+ */
+export interface BrokerNetOptions {
+  readonly enabled: boolean;
+  readonly hosts: readonly string[] | undefined;
+}
+
+/** The resolved secret values the manifest declares; never sent to the audit. */
+export interface BrokerEnvOptions {
+  readonly values: Record<string, string>;
 }
 
 export interface BrokerOptions {
@@ -56,6 +89,8 @@ export interface BrokerOptions {
   readonly budgetMs: number;
   readonly maxOutputBytes: number;
   readonly process: BrokerProcessOptions;
+  readonly net: BrokerNetOptions;
+  readonly env: BrokerEnvOptions;
   readonly signal: AbortSignal | undefined;
   readonly host: RuntimeHost;
   readonly onLog?: (level: LogLevel, message: string) => void;
@@ -82,6 +117,10 @@ export class Broker {
   #readCache: { readonly path: string; readonly text: string } | undefined;
   /** Chunked `fs.write` buffers, keyed by resolved path, flushed on `eof`. */
   readonly #pendingWrites = new Map<string, { offset: number; bytes: number; parts: string[] }>();
+  /** The response body of the last `net.fetch`, between its chunks. */
+  #netCache: { readonly url: string; readonly body: string } | undefined;
+  /** Resolved secret values, longest first; built once per broker. */
+  #secrets: readonly string[] | undefined;
 
   constructor(options: BrokerOptions) {
     this.#options = options;
@@ -99,13 +138,20 @@ export class Broker {
       return JSON.stringify({ ok: true, value: result.value });
     } catch (error) {
       const runtimeError = this.#asRuntimeError(error);
-      this.#options.audit.deny(
-        kind,
-        runtimeError.code,
-        runtimeError.code === 'secret_path_denied' ? '<redacted>' : target,
-      );
+      this.#options.audit.deny(kind, runtimeError.code, this.#deniedTarget(kind, target, runtimeError.code));
       throw runtimeError;
     }
+  }
+
+  /**
+   * What a denial row records. A secret-path denial never records the name it
+   * refused, and a `net.fetch` denial never records the URL: the query string of
+   * a refused request can hold exactly the credential the tool was not allowed
+   * to send. Everything else keeps its path, argv[0] basename or pattern.
+   */
+  #deniedTarget(kind: string, target: string, code: string): string {
+    if (code === 'secret_path_denied' || kind === 'net.fetch') return '<redacted>';
+    return target;
   }
 
   #dispatch(kind: string, payload: Record<string, unknown>): HandlerResult {
@@ -123,11 +169,9 @@ export class Broker {
       case 'process.run':
         return this.#process(payload);
       case 'net.fetch':
-        // Accepted only so the refusal is enforced and audited host-side.
-        throw new ToolRuntimeError(
-          'net_not_supported',
-          'the sandbox has no network; the z1 host performs net.fetch',
-        );
+        return this.#fetch(payload);
+      case 'env.read':
+        return this.#env();
       case 'log':
         return this.#log(payload);
       default:
@@ -444,8 +488,217 @@ export class Broker {
     const message = stringField(payload, 'message');
     const capped =
       message.length > MAX_LOG_MESSAGE ? `${message.slice(0, MAX_LOG_MESSAGE)}...` : message;
-    this.#options.onLog?.(level as LogLevel, capped);
+    // A tool that logs a secret it was granted must not put it in a log file:
+    // every resolved value of 8+ characters is replaced before it leaves here.
+    this.#options.onLog?.(level as LogLevel, this.#mask(capped));
     return { value: null, target: 'log' };
+  }
+
+  /**
+   * `ctx.net.fetch`: validate, follow redirects one hop at a time, relay the
+   * final body back in chunks.
+   *
+   * The body is **not** returned whole: it is cached here and the shim pulls it
+   * with `{ offset }` calls, the same `next` cursor `fs.read` uses, because a
+   * multi-megabyte string crossing the bridge in one call is what makes the
+   * QuickJS teardown abort (see `SECURITY.md`).
+   */
+  #fetch(payload: Record<string, unknown>): HandlerResult {
+    if (!this.#options.net.enabled) {
+      throw new ToolRuntimeError(
+        'net_disabled',
+        'net.fetch is disabled for this runtime; the host passed net: false',
+      );
+    }
+    if (payload.offset !== undefined) return this.#fetchChunk(payload);
+
+    const method = assertFetchMethod(payload.method);
+    const headers = assertFetchHeaders(payload.headers);
+    const body = this.#requestBody(payload);
+    const sendsBody = method !== 'GET' && method !== 'HEAD';
+
+    let current = this.#assertHop(stringField(payload, 'url'), 'net.fetch');
+    let currentMethod = method;
+    let currentHeaders = headers;
+    let currentBody = sendsBody ? body : undefined;
+
+    for (let hop = 0; hop <= SANDBOX_MAX_NET_REDIRECTS; hop += 1) {
+      this.#ensureBudget();
+      const relayed = relayFetch(this.#options.host, {
+        url: current.toString(),
+        method: currentMethod,
+        headers: currentHeaders,
+        body: currentBody,
+        remainingMs: this.#options.deadline - this.#options.now(),
+      });
+      if (!REDIRECT_STATUSES.includes(relayed.status) || relayed.location === null) {
+        return this.#netResult(relayed, current.toString());
+      }
+      if (hop === SANDBOX_MAX_NET_REDIRECTS) {
+        throw new ToolRuntimeError(
+          'net_failed',
+          `net.fetch followed more than ${SANDBOX_MAX_NET_REDIRECTS} redirects`,
+        );
+      }
+      // Validate the hop *before* it is requested: a redirect to a denied host
+      // is refused without a second socket, which is the whole point of
+      // `redirect: 'manual'` in the helper.
+      const next = this.#assertHop(
+        this.#resolveLocation(relayed.location, current),
+        'net.fetch redirect',
+      );
+      // 303 means "see other" and always becomes GET. 301/302 turn a POST into a
+      // GET in every browser, and resending a form body to a different URL is
+      // the kind of surprise a capability boundary must not allow. 307/308
+      // exist precisely to keep method and body, so they do.
+      if (
+        relayed.status === 303 ||
+        ((relayed.status === 301 || relayed.status === 302) && currentMethod === 'POST')
+      ) {
+        currentMethod = 'GET';
+        currentBody = undefined;
+        currentHeaders = dropEntityHeaders(currentHeaders);
+      }
+      current = next;
+    }
+    throw new ToolRuntimeError('net_failed', 'the redirect chain did not finish');
+  }
+
+  /**
+   * Check one URL against both allow-lists: the manifest's `net.hosts` and, when
+   * the host passed one, its own ceiling. Both must allow the host, so a host
+   * that asked for less than the manifest cannot be talked out of it by a tool.
+   */
+  #assertHop(url: string, label: string): URL {
+    const parsed = assertFetchUrl(url, this.#capabilities.net.hosts, label);
+    const ceiling = this.#options.net.hosts;
+    if (ceiling !== undefined && !hostAllowed(parsed.hostname, ceiling)) {
+      throw new ToolRuntimeError(
+        'net_denied',
+        `${label} is not allowed to reach "${parsed.hostname}": the host ceiling does not list it`,
+      );
+    }
+    return parsed;
+  }
+
+  /** Resolve a `Location` header against the hop that produced it. */
+  #resolveLocation(location: string, base: URL): string {
+    try {
+      return new URL(location, base).toString();
+    } catch {
+      throw new ToolRuntimeError('net_failed', 'the redirect location is not a valid URL');
+    }
+  }
+
+  /** The request body, capped, or `undefined` when the tool sent none. */
+  #requestBody(payload: Record<string, unknown>): string | undefined {
+    if (payload.body === undefined || payload.body === null) return undefined;
+    const body = stringField(payload, 'body');
+    const bytes = Buffer.byteLength(body, 'utf8');
+    if (bytes > SANDBOX_MAX_NET_REQUEST_BYTES) {
+      throw new ToolRuntimeError(
+        'invalid_arguments',
+        `net.fetch request bodies are limited to ${SANDBOX_MAX_NET_REQUEST_BYTES} bytes, this one is ${bytes}`,
+      );
+    }
+    return body;
+  }
+
+  /** The first chunk of a finished response, plus the cursor for the rest. */
+  #netResult(relayed: NetRelayResult, url: string): HandlerResult {
+    const head = {
+      ok: relayed.status >= 200 && relayed.status <= 299,
+      status: relayed.status,
+      statusText: relayed.statusText,
+      url,
+      headers: relayed.headers,
+    };
+    const chunk = netChunk(relayed.body, 0, NET_CHUNK_BYTES, (data, next) => ({
+      ...head,
+      data,
+      next,
+    }));
+    // Keep the body between chunks only while there is something left to pull.
+    this.#netCache = chunk.next === null ? undefined : { url, body: relayed.body };
+    return { value: { ...head, data: chunk.data, next: chunk.next }, target: url };
+  }
+
+  /** One follow-up chunk of the cached response body. */
+  #fetchChunk(payload: Record<string, unknown>): HandlerResult {
+    const cached = this.#netCache;
+    if (cached === undefined) {
+      throw new ToolRuntimeError(
+        'invalid_arguments',
+        'net.fetch has no response body to continue; start the request without an offset',
+      );
+    }
+    const offset = payload.offset;
+    if (typeof offset !== 'number' || !Number.isInteger(offset) || offset <= 0) {
+      throw new ToolRuntimeError('invalid_arguments', 'net.fetch offset must be a positive integer');
+    }
+    if (offset > cached.body.length) {
+      throw new ToolRuntimeError(
+        'invalid_arguments',
+        `net.fetch offset ${offset} is past the end of the response body`,
+      );
+    }
+    const chunk = netChunk(cached.body, offset, NET_CHUNK_BYTES, (data, next) => ({ data, next }));
+    if (chunk.next === null) this.#netCache = undefined;
+    return { value: { data: chunk.data, next: chunk.next }, target: cached.url };
+  }
+
+  /**
+   * `ctx.env`: the resolved values of the names the manifest declares, and
+   * nothing else. An undeclared name is simply absent, so the VM-side object can
+   * be frozen without leaving a hole a tool could fill.
+   */
+  #env(): HandlerResult {
+    const values: Record<string, string> = {};
+    const names: string[] = [];
+    const source = this.#options.env.values;
+    for (const name of this.#declaredEnv()) {
+      const value = source[name];
+      if (typeof value !== 'string') continue;
+      // defineProperty, not assignment: a variable may legitimately be named
+      // "__proto__", and `values['__proto__'] = x` would reach the prototype.
+      Object.defineProperty(values, name, {
+        value,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+      names.push(name);
+    }
+    return { value: { values }, target: envTarget(names) };
+  }
+
+  /** The manifest's `env.read`, validated: exact names only, never `'*'`. */
+  #declaredEnv(): string[] {
+    // A hand-written `tool.json` may omit `env` entirely (the manifest check
+    // tolerates it), so the read is defensive even though the type says it is
+    // there; a wildcard in a hand-edited manifest is refused here, per call.
+    return assertEnvNames(this.#capabilities.env?.read);
+  }
+
+  /** Every resolved value a log line or a message must not carry. */
+  get #secretValues(): readonly string[] {
+    this.#secrets ??= [
+      ...new Set(
+        Object.values(this.#options.env.values).filter(
+          (value) => typeof value === 'string' && value.length >= MIN_SECRET_LENGTH,
+        ),
+      ),
+    ].sort((left, right) => right.length - left.length);
+    return this.#secrets;
+  }
+
+  /** Replace every resolved secret value of 8+ characters with `[redacted]`. */
+  #mask(text: string): string {
+    let masked = text;
+    for (const secret of this.#secretValues) {
+      if (masked.includes(secret)) masked = masked.split(secret).join('[redacted]');
+    }
+    return masked;
   }
 
   /** Walk the workspace for glob and grep: files only, no symlinks, no denials. */
@@ -536,7 +789,18 @@ export class Broker {
   }
 
   #asRuntimeError(error: unknown): ToolRuntimeError {
-    if (error instanceof ToolRuntimeError) return error;
+    if (error instanceof ToolRuntimeError) {
+      // A refusal can name what the tool sent (a pattern, an option key, a
+      // header). None of it may carry a granted secret back to the VM or into
+      // the host log, so the message is masked once, here.
+      const masked = this.#mask(error.message);
+      if (masked === error.message) return error;
+      return new ToolRuntimeError(error.code, masked, {
+        ...(error.tool === undefined ? {} : { tool: error.tool }),
+        ...(error.details === undefined ? {} : { details: error.details }),
+        cause: error,
+      });
+    }
     this.#options.warn?.(`z1 runtime: unexpected broker failure: ${describeError(error)}`);
     return new ToolRuntimeError('tool_threw', 'the sandbox broker failed');
   }
@@ -566,6 +830,14 @@ export class Broker {
       return kind;
     }
     if (kind === 'log') return 'log';
+    if (kind === 'env.read') return 'env.read';
+    if (kind === 'net.fetch') {
+      // Chunk pulls carry an offset, not a URL; the allow row of the request
+      // itself has the URL and the follow-up chunks reuse it.
+      if (typeof payload.offset === 'number') return this.#netCache?.url ?? 'net.fetch';
+      const url = payload.url;
+      return typeof url === 'string' && isAuditableTarget(url) ? url : 'net.fetch';
+    }
     if (kind === 'process.run') {
       const argv = payload.argv;
       if (Array.isArray(argv) && typeof argv[0] === 'string') {
@@ -626,6 +898,53 @@ function readChunk(text: string, offset: number, length: number): { data: string
   }
   const next = offset + size < text.length ? offset + size : null;
   return { data, next };
+}
+
+/**
+ * One chunk of a response body, shrunk until the serialized reply fits the
+ * bridge cap — the same discipline as {@link readChunk}, because `net.fetch`
+ * replies cross the same bridge and the body is the only large field.
+ */
+function netChunk(
+  body: string,
+  offset: number,
+  length: number,
+  envelope: (data: string, next: number | null) => unknown,
+): { data: string; next: number | null } {
+  let size = Math.max(0, Math.min(length, body.length - offset));
+  let data = '';
+  let next: number | null = null;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    data = body.slice(offset, offset + size);
+    next = offset + size < body.length ? offset + size : null;
+    const bytes = Buffer.byteLength(
+      JSON.stringify({ ok: true, value: envelope(data, next) }),
+      'utf8',
+    );
+    if (bytes <= SANDBOX_MAX_BRIDGE_BYTES || size <= 1) break;
+    const scaled = Math.floor((size * SANDBOX_MAX_BRIDGE_BYTES) / bytes);
+    size = Math.max(1, Math.min(size - 1, scaled));
+  }
+  data = body.slice(offset, offset + size);
+  next = offset + size < body.length ? offset + size : null;
+  return { data, next };
+}
+
+/** A redirect that becomes a GET must not keep the body's content type. */
+function dropEntityHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() === 'content-type') continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+/** The `env.read` audit target: the names, never a value, never unbounded. */
+function envTarget(names: readonly string[]): string {
+  if (names.length === 0) return 'env.read';
+  const joined = names.join(',');
+  return joined.length <= MAX_ENV_AUDIT_TARGET ? joined : `${names.length} names`;
 }
 
 function parsePayload(payloadJson: string): Record<string, unknown> {

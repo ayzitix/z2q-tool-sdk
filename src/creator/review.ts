@@ -40,6 +40,9 @@ const MAX_REPORTED_MESSAGE = 500;
 
 const ALLOWED_MODULES = new Set(['z1-tool-sdk', 'zod']);
 
+/** The same shape `defineTool` and the runtime enforce on `env.read`. */
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
  * Identifiers a generated tool may never contain. Strings and comments are not
  * identifiers, so `'process'` and `// eval` are allowed. The list is closed:
@@ -223,6 +226,14 @@ export function reviewToolSource(source: string): ToolSourceReport {
     }
   }
 
+  // Rule 6 (second half): a call the manifest does not declare is refused here,
+  // after every other rule, so a source that breaks an older rule still reports
+  // that rule first.
+  if (capabilities !== undefined) {
+    const undeclared = findUndeclaredCapability(tokens, capabilities);
+    if (undeclared !== undefined) issues.push(undeclared);
+  }
+
   const report: ToolSourceReport = { ok: issues.length === 0, issues };
   if (name !== undefined) report.name = name;
   if (version !== undefined) report.version = version;
@@ -273,12 +284,6 @@ export function assessToolManifest(manifest: ToolManifest): ToolSourceReport {
   const issues: ToolSourceIssue[] = [];
   const capabilities = manifest.capabilities;
 
-  if (capabilities.net.hosts.length > 0) {
-    issues.push({
-      code: 'network_not_supported',
-      message: 'the runtime refuses net.fetch; remove capabilities.net',
-    });
-  }
   const argvGrant = capabilities.process.argv.find((grant) => !isBareExecutableName(grant));
   if (argvGrant !== undefined) {
     issues.push({
@@ -1178,16 +1183,6 @@ function checkCapabilities(
 ): ManifestCapabilities {
   const entries = root.kind === 'object' ? root.entries : new Map<string, CapabilityValue>();
 
-  const netValue = entries.get('net');
-  if (netValue !== undefined && netValue.kind !== 'undefined') {
-    issues.push({
-      code: 'network_not_supported',
-      message:
-        'net capabilities are not supported: the runtime refuses net.fetch; remove capabilities.net',
-      line: netValue.line,
-    });
-  }
-
   const read: string[] = [];
   const write: string[] = [];
   let fsIssue = false;
@@ -1275,6 +1270,36 @@ function checkCapabilities(
     }
   }
 
+  // Rule 6 reads the net declaration instead of refusing it: the runtime has
+  // `ctx.net.fetch` now, and `capability_undeclared` (below) is what keeps a
+  // call honest. A declaration that is not a literal array grants nothing, so
+  // the shapes the reader cannot understand fail closed.
+  const hosts: string[] = [];
+  const netValue = entries.get('net');
+  if (netValue !== undefined && netValue.kind === 'object') {
+    const value = netValue.entries.get('hosts');
+    if (value !== undefined && value.kind === 'array') {
+      for (const item of value.items) {
+        const grant = item.kind === 'string' ? item.value.trim() : '';
+        if (grant.length > 0) hosts.push(grant);
+      }
+    }
+  }
+
+  // Rule 6 also reads env.read: exact names only, so a glob or `'*'` grants
+  // nothing here and `defineTool` refuses it at build time.
+  const envRead: string[] = [];
+  const envValue = entries.get('env');
+  if (envValue !== undefined && envValue.kind === 'object') {
+    const value = envValue.entries.get('read');
+    if (value !== undefined && value.kind === 'array') {
+      for (const item of value.items) {
+        const name = item.kind === 'string' ? item.value.trim() : '';
+        if (ENV_NAME_PATTERN.test(name)) envRead.push(name);
+      }
+    }
+  }
+
   const limits = {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -1316,9 +1341,92 @@ function checkCapabilities(
   return {
     fs: { read: uniqueSorted(read), write: uniqueSorted(write) },
     process: { argv: uniqueSorted(argv) },
-    net: { hosts: [] },
+    net: { hosts: uniqueSorted(hosts) },
+    env: { read: uniqueSorted(envRead) },
     limits,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6, second half: capability_undeclared
+//
+// The runtime grants `ctx.net.fetch` and `ctx.env` by declaration, so a call the
+// manifest does not declare would just be denied at run time. This rule turns
+// that into a review issue: it is cheap, it names the name that is missing, and
+// it is the only way a generated tool learns the allow-list exists.
+// ---------------------------------------------------------------------------
+
+/**
+ * The first `ctx.net.fetch` or `ctx.env.<NAME>` the manifest does not declare.
+ *
+ * It reads the token stream, so it knows exactly what the identifier rule knows:
+ * strings and comments are skipped, and a member access is a name. Three shapes
+ * are recognised, and the rest is deliberately left alone because guessing
+ * would refuse a source that is honest:
+ *
+ * - `ctx.net.fetch(...)`: refused when `net.hosts` is empty;
+ * - `net.fetch(...)`: the same call through a local alias. Rule 4 already
+ *   refuses the bare identifier, so this is a backstop, not the main path;
+ * - `ctx.env.NAME`: refused when `NAME` is not in `env.read`.
+ *
+ * A computed access (`ctx.env[name]`) is not modelled: the lint is advisory and
+ * the runtime denies the undeclared name anyway (`ctx.env` is exactly the
+ * declared ones), which is why the omission is safe.
+ */
+function findUndeclaredCapability(
+  tokens: readonly Token[],
+  capabilities: ManifestCapabilities,
+): ToolSourceIssue | undefined {
+  const declaredEnv = new Set(capabilities.env.read);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined || token.kind !== 'ident') continue;
+
+    if (token.value === 'ctx') {
+      if (!isPunct(tokens[index + 1], '.')) continue;
+      const member = tokens[index + 2];
+      if (!isPunct(tokens[index + 3], '.')) continue;
+      const name = tokens[index + 4];
+      if (member === undefined || member.kind !== 'ident') continue;
+      if (name === undefined || name.kind !== 'ident') continue;
+      if (member.value === 'net' && name.value === 'fetch') {
+        if (capabilities.net.hosts.length === 0) {
+          return {
+            code: 'capability_undeclared',
+            message:
+              'ctx.net.fetch requires capabilities.net.hosts; declare net: { hosts: ["api.example.com"] } (or ["*"])',
+            line: name.line,
+          };
+        }
+        continue;
+      }
+      if (member.value === 'env' && !declaredEnv.has(name.value)) {
+        return {
+          code: 'capability_undeclared',
+          message: `ctx.env.${name.value} is not declared; add "${name.value}" to capabilities.env.read`,
+          line: name.line,
+        };
+      }
+      continue;
+    }
+
+    // A bare `net.fetch(...)`: `net` is not a property name here, so rule 4
+    // refuses the identifier as well. Kept so the message names the missing
+    // declaration rather than only the forbidden identifier.
+    if (token.value === 'net' && !isPunct(tokens[index - 1], '.')) {
+      if (!isPunct(tokens[index + 1], '.')) continue;
+      if (!isIdent(tokens[index + 2], 'fetch')) continue;
+      if (capabilities.net.hosts.length === 0) {
+        return {
+          code: 'capability_undeclared',
+          message:
+            'net.fetch requires capabilities.net.hosts; declare net: { hosts: ["api.example.com"] } (or ["*"])',
+          line: token.line,
+        };
+      }
+    }
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------

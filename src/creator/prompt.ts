@@ -19,7 +19,6 @@ export type ToolCreatorCode =
   | 'capabilities_mismatch'
   | 'invalid_approval'
   | 'not_installed'
-  | 'network_not_supported'
   | 'limit_too_large'
   | 'invalid_fs_grant'
   | 'invalid_argv_grant';
@@ -130,7 +129,9 @@ ctx.process.run({ argv: ['git', 'status'], cwd, env, stdin }) returns { code, st
   argv is an executable plus arguments, never a shell string; argv[0] must be granted.
 ctx.log(level, message) writes to the host log.
 ctx.signal is a frozen { aborted: false }; the VM cannot observe an abort mid-call.
-There is no network: ctx.net.fetch always fails, and net capabilities are refused.
+ctx.net.fetch(url, { method, headers, body }) -> { ok, status, statusText, url, headers, body, text, json() }
+  http(s) only, and only the hosts the manifest declares.
+ctx.env.NAME is a string when the manifest declares env.read ['NAME']; otherwise undefined.
 
 ## Capabilities are declarations
 
@@ -138,7 +139,10 @@ fs.read and fs.write: workspace-relative globs. Never absolute, never "..".
 process.argv: bare executable names such as "git". Never a path, never a flag.
 limits.timeoutMs: at most 60000 (default 30000).
 limits.maxOutputBytes: at most 8388608 (default 1048576).
-net: not supported. Do not declare it, not even with an empty host list.
+net: { hosts: ['api.example.com'] } - the host allow-list for ctx.net.fetch; '*' means any
+  host, '*.example.com' covers the domain and its subdomains, and [] means no network.
+env: { read: ['EXA_API_KEY'] } - exact environment variable names for ctx.env. No globs,
+  no '*': a secret is granted by name or not at all.
 
 ## Rules
 
@@ -148,7 +152,8 @@ net: not supported. Do not declare it, not even with an empty host list.
   worker_threads, net, http, https, dns, tls, dgram, os, v8, Atomics, SharedArrayBuffer
   or WebAssembly. Strings and comments are not identifiers, but do not rely on that:
   use ctx for every host capability.
-- No Node builtins, no fetch, no timers, no global state, no network. Use ctx.
+- No Node builtins, no global fetch, no timers, no global state. Use ctx for the network
+  and for secrets, and declare every host and name you use.
 - Keep the whole file under 32 KiB.
 - The tool must be deterministic and return JSON-serializable values.`;
 

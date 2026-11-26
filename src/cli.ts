@@ -28,7 +28,8 @@ import type { Json, ToolManifest } from './types.js';
 const HELP = `z1-tool - author, test and package z1 tools
 
 Usage:
-  z1-tool <command> [options]
+  z1 tool <command> [options]     the console runs this CLI as a z1 subcommand
+  z1-tool <command> [options]     z1-tool is this package's own binary, not on PATH here
 
 Commands:
   init <name> [dir]  create a tool package (default dir: ./<name>)
@@ -475,13 +476,14 @@ async function installCommand(args: string[]): Promise<number> {
   if (hasHelp(args)) {
     console.log(
       [
-        'Usage: z1-tool install <dir> [--tools <dir>] [--approved-by <name>]',
-        '                        [--expect-sha256 <hex>] [--allow-prebuilt]',
+        'Usage: z1 tool install <dir> [--tools <dir>] [--approved-by <name>]',
+        '                      [--expect-sha256 <hex>] [--allow-prebuilt]',
         '',
         'Reviews and always rebuilds tool.ts when present, then installs the build',
         'under <tools>/<name>/<version>/ with approval.json. A dist-only directory',
         'needs --expect-sha256 or --allow-prebuilt. A version is immutable.',
-        '--tools defaults to ./.z1/tools.',
+        '--tools defaults to ./.z2q/tools, the same root the creator installs into.',
+        "'z1-tool install' is the same command through this package's own binary.",
       ].join('\n'),
     );
     return 0;
@@ -494,11 +496,11 @@ async function installCommand(args: string[]): Promise<number> {
   const target = parsed.positionals[0];
   if (target === undefined) {
     throw new Error(
-      'usage: z1-tool install <dir> [--tools <dir>] [--approved-by <name>] [--expect-sha256 <hex>] [--allow-prebuilt]',
+      'usage: z1 tool install <dir> [--tools <dir>] [--approved-by <name>] [--expect-sha256 <hex>] [--allow-prebuilt]',
     );
   }
   const dir = resolve(target);
-  const toolsDir = resolve(parsed.values.get('tools') ?? join(process.cwd(), '.z1', 'tools'));
+  const toolsDir = resolve(parsed.values.get('tools') ?? join(process.cwd(), '.z2q', 'tools'));
   const approvedBy = parsed.values.get('approved-by');
   const entry = join(dir, 'tool.ts');
   const entryInfo = await stat(entry).catch(() => undefined);
@@ -537,9 +539,10 @@ async function installedCommand(args: string[]): Promise<number> {
   if (hasHelp(args)) {
     console.log(
       [
-        'Usage: z1-tool installed [--tools <dir>]',
+        'Usage: z1 tool installed [--tools <dir>]',
         '',
-        'Lists installed versions. --tools defaults to ./.z1/tools.',
+        'Lists installed versions. --tools defaults to ./.z2q/tools, the same root',
+        'the creator installs into.',
       ].join('\n'),
     );
     return 0;
@@ -548,12 +551,13 @@ async function installedCommand(args: string[]): Promise<number> {
   if (parsed.positionals.length > 0) {
     throw new Error(`unexpected argument "${parsed.positionals[0]}"`);
   }
-  const toolsDir = resolve(parsed.values.get('tools') ?? join(process.cwd(), '.z1', 'tools'));
+  const toolsDir = resolve(parsed.values.get('tools') ?? join(process.cwd(), '.z2q', 'tools'));
   const installed = await listInstalledTools(toolsDir);
   if (installed.length === 0) {
     console.log(`no tools installed in ${toolsDir}`);
     return 0;
   }
+  console.log(`tools: ${toolsDir}`);
   for (const tool of installed) {
     const approved = tool.approvedBy === undefined ? '' : ` approved-by=${tool.approvedBy}`;
     console.log(

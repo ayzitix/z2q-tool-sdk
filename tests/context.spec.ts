@@ -218,16 +218,53 @@ describe('createTestContext net', () => {
       headers: { accept: 'text/plain' },
     });
 
-    expect(response).toEqual({
+    expect(response).toMatchObject({
+      ok: true,
       status: 201,
+      statusText: '',
+      url: 'https://api.example.com/v1',
       headers: { 'content-type': 'text/plain' },
       body: 'ok https://api.example.com/v1',
+      text: 'ok https://api.example.com/v1',
     });
+    // `json` closes over the body, so a destructured call works.
+    const { json } = response;
+    expect(() => json()).toThrow();
     expect(ctx.calls[0]).toMatchObject({
       kind: 'net.fetch',
       url: 'https://api.example.com/v1',
       init: { method: 'GET' },
     });
+  });
+
+  it('derives ok, text and json() from the handler response', async () => {
+    const ctx = createTestContext({
+      fetches: [{ url: 'https://api.example.com/json', handler: () => ({ body: '{"n":1}' }) }],
+    });
+
+    const response = await ctx.net.fetch('https://api.example.com/json');
+
+    expect(response.ok).toBe(true);
+    expect(response.status).toBe(200);
+    expect(response.text).toBe('{"n":1}');
+    expect(response.json()).toEqual({ n: 1 });
+
+    const missing = createTestContext({
+      fetches: [{ url: 'https://api.example.com/missing', handler: () => ({ status: 404 }) }],
+    });
+    const notFound = await missing.net.fetch('https://api.example.com/missing');
+    expect(notFound.ok).toBe(false);
+    expect(notFound.body).toBe('');
+  });
+
+  it('serves env exactly as passed, frozen', () => {
+    const ctx = createTestContext({ env: { EXA_API_KEY: 'secret' } });
+
+    expect(ctx.env.EXA_API_KEY).toBe('secret');
+    expect(ctx.env.OTHER).toBeUndefined();
+    expect(Object.isFrozen(ctx.env)).toBe(true);
+    expect(createTestContext().env).toEqual({});
+    expect(() => createTestContext({ env: { X: 1 as never } })).toThrow(/must be a string/);
   });
 
   it('rejects unhandled hosts, invalid URLs and disabled net', async () => {
