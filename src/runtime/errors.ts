@@ -8,6 +8,7 @@ export type ToolRuntimeCode =
   | 'capability_denied'
   | 'path_outside_workspace'
   | 'path_denied'
+  | 'protected_path'
   | 'secret_path_denied'
   | 'process_argv_denied'
   | 'process_failed'
@@ -29,6 +30,7 @@ export const TOOL_RUNTIME_CODES: readonly ToolRuntimeCode[] = [
   'capability_denied',
   'path_outside_workspace',
   'path_denied',
+  'protected_path',
   'secret_path_denied',
   'process_argv_denied',
   'process_failed',

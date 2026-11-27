@@ -98,6 +98,24 @@ A refusal is thrown into the VM as `Error('<code>: <detail>')` so a tool can
 catch it; if it reaches the host, it becomes a `ToolRuntimeError` with the same
 code.
 
+### Self-protection: the runtime a tool must not break
+
+A tool may not write into the runtime that executes it. A broken runtime cannot
+be repaired by the agent that broke it, so this is a policy refusal, not a prompt
+instruction:
+
+- `node_modules` is never writable at any depth, whoever owns it. Reading stays
+  allowed, because inspecting a dependency damages nothing.
+- `protectedRoots` (absolute paths the host passes to `createToolRuntime`: the CLI
+  checkout, the SDK checkout, the agent home) are never writable. A workspace that
+  *is* one of those roots is refused outright: every write in it would land in the
+  code that is executing the tool.
+- Both fail with `protected_path` before the approval prompt, and the refusal names
+  the runtime directory it refused.
+
+Creating a tool is unaffected: the Tool Creator writes through the host, not
+through the tool sandbox. Only the generated tool's own `ctx.fs.write` is bound.
+
 ## Limits
 
 | Limit | Value | Enforced by |

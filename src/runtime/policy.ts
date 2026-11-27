@@ -34,6 +34,25 @@ const DENIED_SEGMENTS = new Set([
   '.hg',
 ]);
 
+/**
+ * Segments that are readable but never writable, at any depth.
+ *
+ * A tool that overwrites a dependency is a tool that breaks the next call, and
+ * when the workspace happens to be the SDK's own checkout it breaks the runtime
+ * that is executing it. Reading stays allowed: inspecting a dependency does not
+ * damage anything.
+ */
+const PROTECTED_WRITE_SEGMENTS = new Set(['node_modules']);
+
+/**
+ * Absolute directories owned by the runtime that is executing the tool: the CLI
+ * checkout, the SDK checkout and the agent home. A tool must never write into
+ * them — a broken runtime cannot be repaired by the agent that broke it.
+ */
+export interface PathPolicyOptions {
+  readonly protectedRoots?: readonly string[] | undefined;
+}
+
 /** Case-insensitive file names and patterns that are never readable or writable. */
 const DENIED_NAMES = [
   '.env',
@@ -163,12 +182,14 @@ export function assertWritable(
   input: string,
   capabilities: ManifestCapabilities,
   workspace: string,
+  options?: PathPolicyOptions,
 ): string {
   const host = hostNow();
   const relative = assertSafeRelativePath(input, 'fs.write');
   const resolved = assertInsideWorkspace(relative, workspace, 'fs.write');
   assertNotDenied(relative);
   assertGranted(relative, 'write', capabilities);
+  assertNotProtected(relative, resolved, workspace, options);
 
   const parent = host.path.dirname(resolved);
   const root = host.path.resolve(workspace);
@@ -687,6 +708,58 @@ function realpathOrSelf(target: string): string {
   }
 }
 
+/**
+ * Self-protection: a tool may not write into the runtime that is running it.
+ *
+ * Two checks, cheapest first: a forbidden segment anywhere in the path, then the
+ * resolved target against the host's protected roots. Reads are deliberately not
+ * restricted this way — inspecting the runtime cannot break it.
+ */
+function assertNotProtected(
+  relative: string,
+  resolved: string,
+  workspace: string,
+  options?: PathPolicyOptions,
+): void {
+  for (const segment of relative.split('/')) {
+    const lower = segment.toLowerCase();
+    if (PROTECTED_WRITE_SEGMENTS.has(lower)) {
+      throw refusal(
+        'protected_path',
+        `"${segment}" belongs to the runtime and is not writable by a tool`,
+      );
+    }
+  }
+
+  const roots = options?.protectedRoots;
+  if (roots === undefined || roots.length === 0) {
+    return;
+  }
+
+  const host = hostNow();
+  for (const root of roots) {
+    if (typeof root !== 'string' || root.trim().length === 0) continue;
+    if (!host.path.isAbsolute(root)) continue;
+
+    const normalizedRoot = host.path.resolve(root);
+    if (isInside(resolved, normalizedRoot, host.caseInsensitive)) {
+      throw refusal(
+        'protected_path',
+        `"${relative}" is inside the runtime directory ${normalizedRoot}`,
+      );
+    }
+
+    // The workspace itself can be a runtime checkout: a write anywhere in it
+    // would still land in the code that is executing the tool.
+    if (isInside(host.path.resolve(workspace), normalizedRoot, host.caseInsensitive)) {
+      throw refusal(
+        'protected_path',
+        `the workspace is inside the runtime directory ${normalizedRoot}`,
+      );
+    }
+  }
+}
+
 /** Rules 5-6: deny lists, checked after containment and before grants. */
 function assertNotDenied(relative: string): void {
   const segments = relative.split('/');
@@ -819,6 +892,7 @@ function refusal(
     | 'invalid_arguments'
     | 'path_outside_workspace'
     | 'path_denied'
+    | 'protected_path'
     | 'secret_path_denied'
     | 'capability_denied'
     | 'process_argv_denied'

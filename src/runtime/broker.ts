@@ -82,6 +82,8 @@ export interface BrokerEnvOptions {
 
 export interface BrokerOptions {
   readonly workspace: string;
+  /** Absolute runtime directories a tool must never write into. */
+  readonly protectedRoots?: readonly string[] | undefined;
   readonly manifest: ToolManifest;
   readonly audit: AuditCollector;
   readonly now: () => number;
@@ -231,6 +233,7 @@ export class Broker {
       stringField(payload, 'path'),
       this.#capabilities,
       this.#workspace,
+      { protectedRoots: this.#protectedRoots },
     );
     const resolved = host.path.resolve(this.#workspace, relative);
     const offset = integerField(payload, 'offset', 0);
@@ -855,6 +858,10 @@ export class Broker {
 
   get #workspace(): string {
     return this.#options.workspace;
+  }
+
+  get #protectedRoots(): readonly string[] | undefined {
+    return this.#options.protectedRoots;
   }
 }
 

@@ -47,6 +47,13 @@ export {
 export interface ToolRuntimeOptions {
   /** Absolute workspace root; every fs and cwd path must stay inside it. */
   workspace: string;
+  /**
+   * Absolute directories owned by the runtime that executes the tools: the CLI
+   * checkout, the SDK checkout, the agent home. A tool may never write into them,
+   * because a broken runtime cannot be repaired by the agent that broke it.
+   */
+  protectedRoots?: readonly string[];
+
   /** Where audit rows go. An array is treated as a memory sink. */
   audit?: AuditSink | AuditRow[] | null;
   /** Host ceiling over `manifest.capabilities.limits.timeoutMs`. Default 60000. */
@@ -136,6 +143,7 @@ export interface ToolRunResult {
 
 interface NormalizedOptions {
   readonly workspace: string;
+  readonly protectedRoots: readonly string[];
   readonly audit: AuditSink | undefined;
   readonly maxTimeoutMs: number;
   readonly memoryBytes: number;
@@ -212,6 +220,7 @@ export class ToolRuntime {
     const audit = new AuditCollector(tool, version, this.#options.now);
     const broker = new Broker({
       workspace: this.#options.workspace,
+      protectedRoots: this.#options.protectedRoots,
       manifest,
       audit,
       now: this.#options.now,
@@ -295,6 +304,32 @@ export function createToolRuntime(options: ToolRuntimeOptions): Promise<ToolRunt
   return ToolRuntime.create(options);
 }
 
+/**
+ * Validate the host's protected roots once, at construction: every entry must be
+ * an absolute path, and the list is frozen so a later mutation of the caller's
+ * array cannot widen the policy mid-run.
+ */
+function normalizeProtectedRoots(
+  roots: readonly string[] | undefined,
+  host: RuntimeHost,
+): readonly string[] {
+  if (roots === undefined) return [];
+  if (!Array.isArray(roots)) {
+    throw new ToolRuntimeError('invalid_arguments', 'protectedRoots must be an array of absolute paths');
+  }
+  const resolved: string[] = [];
+  for (const root of roots) {
+    if (typeof root !== 'string' || root.trim().length === 0) {
+      throw new ToolRuntimeError('invalid_arguments', 'protectedRoots must contain non-empty paths');
+    }
+    if (!host.path.isAbsolute(root)) {
+      throw new ToolRuntimeError('invalid_arguments', `protectedRoots must be absolute: ${root}`);
+    }
+    resolved.push(host.path.resolve(root));
+  }
+  return Object.freeze(resolved);
+}
+
 function normalizeOptions(options: ToolRuntimeOptions, host: RuntimeHost): NormalizedOptions {
   if (typeof options !== 'object' || options === null) {
     throw new ToolRuntimeError('invalid_arguments', 'createToolRuntime requires an options object');
@@ -338,6 +373,7 @@ function normalizeOptions(options: ToolRuntimeOptions, host: RuntimeHost): Norma
 
   return {
     workspace: resolvedWorkspace,
+    protectedRoots: normalizeProtectedRoots(options.protectedRoots, host),
     audit: toAuditSink(options.audit),
     maxTimeoutMs: positiveInteger(options.maxTimeoutMs, SANDBOX_MAX_TIMEOUT_MS, 'maxTimeoutMs'),
     memoryBytes: positiveInteger(options.memoryBytes, SANDBOX_MEMORY_BYTES, 'memoryBytes'),

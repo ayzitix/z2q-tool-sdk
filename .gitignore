@@ -2,3 +2,6 @@ node_modules
 dist
 *.tgz
 coverage
+
+# agent runtime state (created by tests and by `z1 tools`)
+.z1/
